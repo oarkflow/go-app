@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 )
 
 type Client struct {
 	conn   net.Conn
 	topics map[string]struct{}
+	name   string
 }
 
 type Server struct {
@@ -39,9 +41,9 @@ func (s *Server) Start(address string) {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 	defer listener.Close()
-	
+
 	go s.handleChannels()
-	
+
 	fmt.Println("Server started on", address)
 	for {
 		conn, err := listener.Accept()
@@ -66,7 +68,7 @@ func (s *Server) handleChannels() {
 			s.clients[client.conn] = client
 			s.mu.Unlock()
 			fmt.Println("New client registered")
-		
+
 		case conn := <-s.unregisterCh:
 			s.mu.Lock()
 			client, ok := s.clients[conn]
@@ -79,7 +81,7 @@ func (s *Server) handleChannels() {
 				fmt.Println("Client unregistered")
 			}
 			s.mu.Unlock()
-		
+
 		case message := <-s.broadcastCh:
 			s.mu.Lock()
 			if clients, ok := s.topicClients[message.Topic]; ok {
@@ -108,12 +110,16 @@ func (s *Server) handleConnection(client *Client) {
 			log.Printf("Error decoding message: %v", err)
 			continue
 		}
-		
+
 		switch cmd.Action {
 		case "subscribe":
-			s.subscribe(client, cmd.Topic)
+			s.subscribe(client, cmd.Topics)
 		case "publish":
 			s.broadcastCh <- &Message{Topic: cmd.Topic, Message: cmd.Message}
+		case "unsubscribe":
+			s.unsubscribe(client, cmd.Topics)
+		case "pause":
+			s.pause(client)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -122,15 +128,40 @@ func (s *Server) handleConnection(client *Client) {
 	s.unregisterCh <- client.conn
 }
 
-func (s *Server) subscribe(client *Client, topic string) {
+func (s *Server) subscribe(client *Client, topics string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
-	client.topics[topic] = struct{}{}
-	if s.topicClients[topic] == nil {
-		s.topicClients[topic] = make(map[net.Conn]struct{})
+
+	for _, topic := range strings.Split(topics, ",") {
+		client.topics[topic] = struct{}{}
+		if s.topicClients[topic] == nil {
+			s.topicClients[topic] = make(map[net.Conn]struct{})
+		}
+		s.topicClients[topic][client.conn] = struct{}{}
 	}
-	s.topicClients[topic][client.conn] = struct{}{}
-	
-	fmt.Printf("Client subscribed to topic: %s\n", topic)
+
+	fmt.Printf("Client subscribed to topics: %s\n", topics)
+}
+
+func (s *Server) unsubscribe(client *Client, topics string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, topic := range strings.Split(topics, ",") {
+		delete(client.topics, topic)
+		delete(s.topicClients[topic], client.conn)
+	}
+
+	fmt.Printf("Client unsubscribed from topics: %s\n", topics)
+}
+
+func (s *Server) pause(client *Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for topic := range client.topics {
+		delete(s.topicClients[topic], client.conn)
+	}
+
+	fmt.Printf("Client paused: %s\n", client.name)
 }
