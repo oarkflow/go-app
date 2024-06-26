@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	"github.com/oarkflow/filters"
 )
 
 type TokenType int
@@ -26,6 +28,7 @@ const (
 	TokenLParen
 	TokenRParen
 	TokenComma
+	TokenStar
 )
 
 type Token struct {
@@ -64,8 +67,8 @@ func tokenize(input string) ([]Token, error) {
 			for i < length && isIdentChar(rune(input[i])) {
 				i++
 			}
-			word := strings.ToUpper(input[start:i])
-			switch word {
+			word := input[start:i]
+			switch strings.ToUpper(word) {
 			case "SELECT":
 				tokens = append(tokens, Token{Type: TokenSelect, Value: word})
 			case "FROM":
@@ -125,6 +128,9 @@ func tokenize(input string) ([]Token, error) {
 		case ',':
 			tokens = append(tokens, Token{Type: TokenComma, Value: string(ch)})
 			i++
+		case '*':
+			tokens = append(tokens, Token{Type: TokenStar, Value: string(ch)})
+			i++
 		default:
 			return nil, fmt.Errorf("unrecognized character: %c", ch)
 		}
@@ -170,7 +176,7 @@ func (p *Parser) parse() (*ASTNode, error) {
 	if p.tokens[p.pos].Type == TokenSelect {
 		selectNode := &ASTNode{Type: NodeSelect, Value: "SELECT"}
 		p.pos++
-		for p.tokens[p.pos].Type == TokenIdent {
+		for p.tokens[p.pos].Type == TokenIdent || p.tokens[p.pos].Type == TokenStar {
 			selectNode.Children = append(selectNode.Children, &ASTNode{Type: NodeCondition, Value: p.tokens[p.pos].Value})
 			p.pos++
 			if p.tokens[p.pos].Type == TokenComma {
@@ -295,7 +301,6 @@ func (p *Parser) parsePrimaryCondition() (*ASTNode, error) {
 		rightValues = append(rightValues, p.tokens[p.pos].Value)
 		p.pos++
 	}
-
 	return &ASTNode{
 		Type: NodeCondition,
 		Condition: &Condition{
@@ -306,8 +311,138 @@ func (p *Parser) parsePrimaryCondition() (*ASTNode, error) {
 	}, nil
 }
 
+func validate(node *ASTNode, data map[string]interface{}) bool {
+	switch node.Type {
+	case NodeCondition:
+		return evaluateCondition(node.Condition, data)
+	case NodeAnd:
+		for _, child := range node.Children {
+			if !validate(child, data) {
+				return false
+			}
+		}
+		return true
+	case NodeOr:
+		for _, child := range node.Children {
+			fmt.Println(child.Condition, child.Type)
+			if validate(child, data) {
+				return true
+			}
+		}
+		return false
+	default:
+		for _, child := range node.Children {
+			if child.Condition == nil {
+				continue
+			}
+
+			if !validate(child, data) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func toOperator(sqlOperator string) filters.Operator {
+	switch strings.ToUpper(sqlOperator) {
+	case "=":
+		return filters.Equal
+	case "!=", "<>":
+		return filters.NotEqual
+	case ">":
+		return filters.GreaterThan
+	case "<":
+		return filters.LessThan
+	case ">=":
+		return filters.GreaterThanEqual
+	case "<=":
+		return filters.LessThanEqual
+	case "LIKE":
+		return filters.Contains
+	case "NOT LIKE":
+		return filters.NotContains
+	case "BETWEEN":
+		return filters.Between
+	case "IN":
+		return filters.In
+	case "IS NULL":
+		return filters.IsNull
+	case "IS NOT NULL":
+		return filters.NotNull
+	default:
+		return ""
+	}
+}
+
+func evaluateCondition(cond *Condition, data map[string]interface{}) bool {
+	value, ok := data[cond.Left]
+	if !ok {
+		return false
+	}
+	if strings.Contains(cond.Operator, "IS") {
+		cond.Operator += " " + cond.Right[0]
+	}
+	switch cond.Operator {
+	case ">":
+		return value.(int) > parseInt(cond.Right[0])
+	case "<":
+		return value.(int) < parseInt(cond.Right[0])
+	case "=":
+		return value == parseValue(cond.Right[0])
+	case "IS NOT NULL":
+		return value != nil
+	case "IS NULL":
+		return value == nil
+	case "LIKE":
+		val := strings.Trim(cond.Right[0], "'")
+		if strings.HasPrefix(val, "%") && strings.HasSuffix(val, "%") {
+			val = strings.Trim(val, "%")
+			return strings.Contains(value.(string), val)
+		} else if strings.HasPrefix(val, "%") && !strings.HasSuffix(val, "%") {
+			val = strings.Trim(val, "%")
+			return strings.HasSuffix(value.(string), val)
+		} else if !strings.HasPrefix(val, "%") && strings.HasSuffix(val, "%") {
+			val = strings.Trim(val, "%")
+			return strings.HasPrefix(value.(string), val)
+		}
+		return value.(string) == val
+	case "BETWEEN":
+		return value.(int) >= parseInt(cond.Right[0]) && value.(int) <= parseInt(cond.Right[1])
+	default:
+		return false
+	}
+}
+
+func parseInt(s string) int {
+	var i int
+	fmt.Sscanf(s, "%d", &i)
+	return i
+}
+
+func parseValue(s string) interface{} {
+	if s[0] == '\'' {
+		return strings.Trim(s, "'")
+	}
+	return parseInt(s)
+}
+
+func printAST(node *ASTNode, indent int) {
+	for i := 0; i < indent; i++ {
+		fmt.Print(" ")
+	}
+	if node.Condition != nil {
+		fmt.Printf("%s %s %v\n", node.Condition.Left, node.Condition.Operator, node.Condition.Right)
+	} else {
+		fmt.Println(node.Value)
+	}
+	for _, child := range node.Children {
+		printAST(child, indent+1)
+	}
+}
+
 func main() {
-	sql := "SELECT * FROM abc WHERE (age > 21 AND name = 'John') OR (age IS NOT NULL AND name LIKE '%abc%' AND age BETWEEN 12 AND 200)"
+	sql := "(age > 21 AND name = 'John Doe') AND (age IS NOT NULL AND name LIKE 'John%' AND (age BETWEEN 12 AND 200))"
 	tokens, err := tokenize(sql)
 	if err != nil {
 		fmt.Println("Error tokenizing SQL:", err)
@@ -321,20 +456,13 @@ func main() {
 		return
 	}
 
-	fmt.Println("Parsed AST:")
-	printAST(ast, 0)
-}
+	/*fmt.Println("Parsed AST:")
+	printAST(ast, 0)*/
 
-func printAST(node *ASTNode, indent int) {
-	for i := 0; i < indent; i++ {
-		fmt.Print("  ")
+	data := map[string]interface{}{
+		"age":  25,
+		"name": "John Doe",
 	}
-	if node.Condition != nil {
-		fmt.Printf("%s %s %v\n", node.Condition.Left, node.Condition.Operator, node.Condition.Right)
-	} else {
-		fmt.Println(node.Value)
-	}
-	for _, child := range node.Children {
-		printAST(child, indent+1)
-	}
+
+	fmt.Println("Validation result:", validate(ast, data))
 }
