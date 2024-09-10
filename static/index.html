@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Video Call</title>
+</head>
+<body>
+<h1>P2P Video Call</h1>
+<video id="localVideo" autoplay playsinline muted></video>
+<video id="remoteVideo" autoplay playsinline></video>
+
+<script>
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const peerID = prompt("Enter your peer ID (e.g., peer1 or peer2)");
+    const signalingServerURL = "ws://localhost:8080/ws?id=" + peerID;
+    const connection = new WebSocket(signalingServerURL);
+    let peerConnection;
+    const iceConfig = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' }
+        ]
+    };
+    const iceCandidatesQueue = [];
+    let peer2Connected = false;
+    connection.onmessage = async (msg) => {
+        const data = JSON.parse(msg.data);
+        if (data.sdp) {
+            const remoteDescription = new RTCSessionDescription(data.sdp);
+            await peerConnection.setRemoteDescription(remoteDescription);
+            if (data.sdp.type === 'offer') {
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                connection.send(JSON.stringify({
+                    sdp: peerConnection.localDescription,
+                    from: peerID,
+                    to: data.from
+                }));
+            }
+            while (iceCandidatesQueue.length) {
+                const candidate = iceCandidatesQueue.shift();
+                await peerConnection.addIceCandidate(candidate);
+            }
+        }
+        if (data.candidate) {
+            const candidate = new RTCIceCandidate(data.candidate);
+            if (!peerConnection.remoteDescription) {
+                iceCandidatesQueue.push(candidate);
+            } else {
+                await peerConnection.addIceCandidate(candidate);
+            }
+        }
+        if (data.peer2Connected !== undefined) {
+            peer2Connected = data.peer2Connected;
+        }
+    };
+    async function start() {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideo.srcObject = stream;
+        peerConnection = new RTCPeerConnection(iceConfig);
+        stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+        peerConnection.ontrack = (event) => {
+            if (remoteVideo.srcObject !== event.streams[0]) {
+                remoteVideo.srcObject = event.streams[0];
+                console.log("Received remote stream:", event.streams[0]);
+            }
+        };
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                connection.send(JSON.stringify({
+                    candidate: event.candidate,
+                    from: peerID,
+                    to: peerID === 'peer1' ? 'peer2' : 'peer1'
+                }));
+            }
+        };
+        if (peerID === 'peer1') {
+            console.log("Peer1 is waiting for peer2 to connect...");
+            const checkPeer2Connection = setInterval(() => {
+                if (peer2Connected) {
+                    clearInterval(checkPeer2Connection);
+                    createAndSendOffer();
+                }
+            }, 1000);
+        } else {
+            console.log("Peer2 is waiting for an offer.");
+        }
+    }
+    async function createAndSendOffer() {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        connection.send(JSON.stringify({
+            sdp: peerConnection.localDescription,
+            from: 'peer1',
+            to: 'peer2'
+        }));
+        console.log("Peer1 created and sent offer.");
+    }
+    connection.onopen = () => {
+        console.log("Connected to signaling server");
+        start();
+    };
+    connection.onerror = (error) => {
+        console.error("WebSocket error:", error);
+    };
+</script>
+</body>
+</html>
