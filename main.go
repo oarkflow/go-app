@@ -1,88 +1,63 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
-	"sync"
-
-	"github.com/gorilla/websocket"
+	"os/exec"
+	"strings"
 )
 
-// WebSocket upgrader to upgrade HTTP requests to WebSocket
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
+var restrictedCommands = []string{"rm", "sudo", "poweroff", "shutdown", "reboot", "halt"}
+var allowDestructiveCommands = false
 
-// A map to store connected peers
-var peers = make(map[string]*websocket.Conn)
-var peersLock sync.Mutex
-
-// Message format
-type Message struct {
-	Type      string `json:"type"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	SDP       string `json:"sdp,omitempty"`
-	Candidate string `json:"candidate,omitempty"`
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Upgrade the connection to WebSocket
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Upgrade failed:", err)
-		return
+func isCommandRestricted(cmd string) bool {
+	for _, restricted := range restrictedCommands {
+		if strings.Contains(cmd, restricted) {
+			return true
+		}
 	}
-	defer conn.Close()
+	return false
+}
 
-	// Register the peer with a unique ID (e.g., from URL query or client-side)
-	peerID := r.URL.Query().Get("id")
-	peersLock.Lock()
-	peers[peerID] = conn
-	peersLock.Unlock()
-	log.Println("Peer connected:", peerID)
-
-	for {
-		// Receive message from the peer
-		var msg Message
-		err := conn.ReadJSON(&msg)
+func executeCommand(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodPost {
+		err := r.ParseForm()
 		if err != nil {
-			log.Println("Read error:", err)
-			break
+			http.Error(w, "Unable to parse form", http.StatusBadRequest)
+			return
 		}
-
-		// Forward the message to the intended peer
-		peersLock.Lock()
-		targetConn, ok := peers[msg.To]
-		peersLock.Unlock()
-
-		if ok {
-			err = targetConn.WriteJSON(msg)
-			if err != nil {
-				log.Println("Write error:", err)
-			}
+		cmd := r.FormValue("command")
+		enableDestructive := r.FormValue("enable_destructive")
+		if cmd == "" {
+			http.Error(w, "No command provided", http.StatusBadRequest)
+			return
+		}
+		if enableDestructive == "true" {
+			allowDestructiveCommands = true
 		} else {
-			log.Println("Peer not found:", msg.To)
+			allowDestructiveCommands = false
 		}
+		if !allowDestructiveCommands && isCommandRestricted(cmd) {
+			http.Error(w, "Command is restricted for safety", http.StatusForbidden)
+			return
+		}
+		out, err := exec.Command("bash", "-c", cmd).CombinedOutput()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error executing command: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Write(out)
+	} else {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 	}
-
-	// Remove peer on disconnection
-	peersLock.Lock()
-	delete(peers, peerID)
-	peersLock.Unlock()
-	log.Println("Peer disconnected:", peerID)
 }
 
 func main() {
-	// WebSocket route
-	http.HandleFunc("/ws", handleWebSocket)
-
-	// Start the HTTP server
-	log.Println("Signaling server started at :8080")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal("ListenAndServe:", err)
-	}
+	fs := http.FileServer(http.Dir("./web"))
+	http.Handle("/", fs)
+	http.HandleFunc("/run-command", executeCommand)
+	fmt.Println("Server starting on port 8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
