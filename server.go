@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+type Task struct {
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
+}
+
 type Node struct {
 	ID        string
 	Address   string
@@ -22,20 +27,22 @@ type Node struct {
 type DAGServer struct {
 	Nodes          map[string]*Node
 	Edges          map[string][]string
-	Tasks          [][]byte   // Hold all tasks in a slice
-	taskMutex      sync.Mutex // Mutex to protect access to the Tasks slice
-	nodeStatusCond *sync.Cond // Condition variable to signal when all nodes are ready
-	mutex          sync.Mutex // Mutex to protect access to the DAGServer structure
-	ready          bool       // Flag indicating if the DAG is ready for task processing
-	ConnectedNodes int        // Count of connected nodes
+	Tasks          []Task              // Hold all tasks in a slice
+	taskMutex      sync.Mutex          // Mutex to protect access to the Tasks slice
+	processedTasks map[string]struct{} // Track processed task IDs
+	nodeStatusCond *sync.Cond          // Condition variable to signal when all nodes are ready
+	mutex          sync.Mutex          // Mutex to protect access to the DAGServer structure
+	ready          bool                // Flag indicating if the DAG is ready for task processing
+	ConnectedNodes int                 // Count of connected nodes
 }
 
 func NewDAGServer() *DAGServer {
 	return &DAGServer{
-		Nodes: make(map[string]*Node),
-		Edges: make(map[string][]string),
-		Tasks: make([][]byte, 0), // Initialize empty task slice
-		ready: false,
+		Nodes:          make(map[string]*Node),
+		Edges:          make(map[string][]string),
+		Tasks:          make([]Task, 0),           // Initialize empty task slice
+		processedTasks: make(map[string]struct{}), // Initialize processed task tracker
+		ready:          false,
 	}
 }
 
@@ -137,10 +144,19 @@ func (s *DAGServer) MonitorNodes() {
 	}
 }
 
-func (s *DAGServer) AddTask(task []byte) {
+func (s *DAGServer) AddTask(task Task) {
 	s.taskMutex.Lock()
 	defer s.taskMutex.Unlock()
+
+	// Check for duplicate task ID
+	if _, exists := s.processedTasks[task.ID]; exists {
+		log.Printf("Duplicate task ID detected: %s. Task will not be added.", task.ID)
+		return // Skip processing this task
+	}
+
+	// Add the task to the queue and mark it as processed
 	s.Tasks = append(s.Tasks, task)
+	s.processedTasks[task.ID] = struct{}{}
 
 	log.Printf("Task added to queue. Total queued tasks: %d", len(s.Tasks))
 
@@ -171,7 +187,7 @@ func (s *DAGServer) ProcessTasks() {
 	}
 }
 
-func (s *DAGServer) processTask(task []byte, nodeID string) {
+func (s *DAGServer) processTask(task Task, nodeID string) {
 	s.mutex.Lock()
 	node, exists := s.Nodes[nodeID]
 	s.mutex.Unlock()
@@ -181,7 +197,7 @@ func (s *DAGServer) processTask(task []byte, nodeID string) {
 		return
 	}
 
-	_, err := node.Conn.Write(task)
+	_, err := node.Conn.Write(task.Payload)
 	if err != nil {
 		log.Printf("Failed to send task to node %s: %v", nodeID, err)
 		s.mutex.Lock()
@@ -205,12 +221,26 @@ func (s *DAGServer) processTask(task []byte, nodeID string) {
 	// Move to next node based on DAG logic
 	nextNodes := s.Edges[nodeID]
 	for _, nextNode := range nextNodes {
-		s.processTask(buffer[:n], nextNode)
+		s.processTask(Task{ID: task.ID, Payload: buffer[:n]}, nextNode)
 	}
 }
 
 func (s *DAGServer) ServeAPI() {
 	http.HandleFunc("/add-task", func(w http.ResponseWriter, r *http.Request) {
+		var task Task
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			return
+		}
+
+		// Parse the task from the request body
+		err = json.Unmarshal(body, &task)
+		if err != nil {
+			http.Error(w, "Invalid task format", http.StatusBadRequest)
+			return
+		}
+
 		s.mutex.Lock()
 		allNodesAlive := true
 		for _, node := range s.Nodes {
@@ -225,14 +255,8 @@ func (s *DAGServer) ServeAPI() {
 			fmt.Fprintf(w, "Warning: Some nodes are down. Processing might be delayed.\n")
 		}
 
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-			return
-		}
-
-		s.AddTask(body)
-		fmt.Fprintf(w, "Task added: %s", string(body))
+		s.AddTask(task)
+		fmt.Fprintf(w, "Task added: %s", task.ID)
 	})
 
 	log.Println("Starting HTTP server on :8081")
