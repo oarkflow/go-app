@@ -12,8 +12,12 @@ import (
 )
 
 type Task struct {
-	ID      string          `json:"id"`
-	Payload json.RawMessage `json:"payload"`
+	ID          string          `json:"id"`
+	Payload     json.RawMessage `json:"payload"`
+	CreatedAt   time.Time       `json:"created_at"`
+	ProcessedAt *time.Time      `json:"processed_at,omitempty"`
+	CurrentNode string          `json:"current_node"`
+	Error       string          `json:"error,omitempty"`
 }
 
 type Node struct {
@@ -21,27 +25,27 @@ type Node struct {
 	Address   string
 	Conn      net.Conn
 	Connected bool
-	Alive     bool // Track if node is alive
+	Alive     bool
 }
 
 type DAGServer struct {
 	Nodes          map[string]*Node
 	Edges          map[string][]string
-	Tasks          []Task              // Hold all tasks in a slice
-	taskMutex      sync.Mutex          // Mutex to protect access to the Tasks slice
-	processedTasks map[string]struct{} // Track processed task IDs
-	nodeStatusCond *sync.Cond          // Condition variable to signal when all nodes are ready
-	mutex          sync.Mutex          // Mutex to protect access to the DAGServer structure
-	ready          bool                // Flag indicating if the DAG is ready for task processing
-	ConnectedNodes int                 // Count of connected nodes
+	Tasks          []Task
+	taskMutex      sync.Mutex
+	processedTasks map[string]struct{}
+	nodeStatusCond *sync.Cond
+	mutex          sync.Mutex
+	ready          bool
+	ConnectedNodes int
 }
 
 func NewDAGServer() *DAGServer {
 	return &DAGServer{
 		Nodes:          make(map[string]*Node),
 		Edges:          make(map[string][]string),
-		Tasks:          make([]Task, 0),           // Initialize empty task slice
-		processedTasks: make(map[string]struct{}), // Initialize processed task tracker
+		Tasks:          make([]Task, 0),
+		processedTasks: make(map[string]struct{}),
 		ready:          false,
 	}
 }
@@ -89,7 +93,6 @@ func (s *DAGServer) RegisterNode(conn net.Conn) {
 		log.Printf("Node %s registered and connected", node.ID)
 	}
 
-	// Signal the nodeStatusCond in case the nodes are ready
 	s.nodeStatusCond.Broadcast()
 }
 
@@ -114,14 +117,13 @@ func (s *DAGServer) WaitForNodes() {
 			break
 		}
 
-		// Wait until nodeStatusCond is signaled indicating a change in node status
 		s.nodeStatusCond.Wait()
 	}
 }
 
 func (s *DAGServer) MonitorNodes() {
 	for {
-		time.Sleep(10 * time.Second) // Monitor every 10 seconds
+		time.Sleep(10 * time.Second)
 
 		s.mutex.Lock()
 		for _, node := range s.Nodes {
@@ -139,7 +141,6 @@ func (s *DAGServer) MonitorNodes() {
 		}
 		s.mutex.Unlock()
 
-		// Signal the nodeStatusCond if nodes' statuses have changed
 		s.nodeStatusCond.Broadcast()
 	}
 }
@@ -148,19 +149,20 @@ func (s *DAGServer) AddTask(task Task) {
 	s.taskMutex.Lock()
 	defer s.taskMutex.Unlock()
 
-	// Check for duplicate task ID
+	task.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+	task.CreatedAt = time.Now()
+	task.CurrentNode = "start"
+
 	if _, exists := s.processedTasks[task.ID]; exists {
 		log.Printf("Duplicate task ID detected: %s. Task will not be added.", task.ID)
-		return // Skip processing this task
+		return
 	}
 
-	// Add the task to the queue and mark it as processed
 	s.Tasks = append(s.Tasks, task)
 	s.processedTasks[task.ID] = struct{}{}
 
-	log.Printf("Task added to queue. Total queued tasks: %d", len(s.Tasks))
+	log.Printf("Task %s added to queue. Total queued tasks: %d", task.ID, len(s.Tasks))
 
-	// If the DAG is ready, process tasks immediately
 	if s.ready {
 		s.nodeStatusCond.Broadcast()
 	}
@@ -168,60 +170,77 @@ func (s *DAGServer) AddTask(task Task) {
 
 func (s *DAGServer) ProcessTasks() {
 	for {
-		// Wait until all nodes are ready
+
 		s.nodeStatusCond.L.Lock()
 		for !s.ready {
 			s.nodeStatusCond.Wait()
 		}
 		s.nodeStatusCond.L.Unlock()
 
-		// Process all queued tasks
 		s.taskMutex.Lock()
 		tasksToProcess := s.Tasks
-		s.Tasks = nil // Clear the task queue
+		s.Tasks = nil
 		s.taskMutex.Unlock()
 
 		for _, task := range tasksToProcess {
-			go s.processTask(task, "start") // assuming "start" is the initial node
+			go s.processTask(task, "start")
 		}
 	}
 }
 
 func (s *DAGServer) processTask(task Task, nodeID string) {
-	s.mutex.Lock()
-	node, exists := s.Nodes[nodeID]
-	s.mutex.Unlock()
-
-	if !exists || !node.Connected || !node.Alive {
-		log.Printf("Node %s not found, not connected, or not alive", nodeID)
-		return
-	}
-
-	_, err := node.Conn.Write(task.Payload)
-	if err != nil {
-		log.Printf("Failed to send task to node %s: %v", nodeID, err)
+	for {
 		s.mutex.Lock()
-		node.Alive = false
+		node, exists := s.Nodes[nodeID]
 		s.mutex.Unlock()
-		return
-	}
 
-	buffer := make([]byte, 1024)
-	n, err := node.Conn.Read(buffer)
-	if err != nil {
-		log.Printf("Failed to read response from node %s: %v", nodeID, err)
-		s.mutex.Lock()
-		node.Alive = false
-		s.mutex.Unlock()
-		return
-	}
+		if !exists {
+			log.Printf("Node %s not found. Task %s cannot be processed.", nodeID, task.ID)
+			return
+		}
 
-	log.Printf("Node %s processed task. Response: %s", nodeID, string(buffer[:n]))
+		if node.Connected && node.Alive {
+			_, err := node.Conn.Write(task.Payload)
+			if err != nil {
+				log.Printf("Failed to send task %s to node %s: %v", task.ID, nodeID, err)
+				s.mutex.Lock()
+				node.Alive = false
+				s.mutex.Unlock()
+				return
+			}
 
-	// Move to next node based on DAG logic
-	nextNodes := s.Edges[nodeID]
-	for _, nextNode := range nextNodes {
-		s.processTask(Task{ID: task.ID, Payload: buffer[:n]}, nextNode)
+			buffer := make([]byte, 1024)
+			n, err := node.Conn.Read(buffer)
+			if err != nil {
+				log.Printf("Failed to read response for task %s from node %s: %v", task.ID, nodeID, err)
+				s.mutex.Lock()
+				node.Alive = false
+				s.mutex.Unlock()
+				return
+			}
+
+			processedTime := time.Now()
+			task.ProcessedAt = &processedTime
+			task.CurrentNode = nodeID
+			log.Printf("Node %s processed task %s. Response: %s", nodeID, task.ID, string(buffer[:n]))
+
+			nextNodes := s.Edges[nodeID]
+			for _, nextNode := range nextNodes {
+
+				newTask := Task{
+					ID:          task.ID,
+					Payload:     buffer[:n],
+					CreatedAt:   task.CreatedAt,
+					ProcessedAt: nil,
+					CurrentNode: nextNode,
+				}
+				s.processTask(newTask, nextNode)
+			}
+			return
+		} else {
+			log.Printf("Node %s not alive or not connected. Deferring task %s", nodeID, task.ID)
+			time.Sleep(5 * time.Second)
+		}
 	}
 }
 
@@ -234,7 +253,6 @@ func (s *DAGServer) ServeAPI() {
 			return
 		}
 
-		// Parse the task from the request body
 		err = json.Unmarshal(body, &task)
 		if err != nil {
 			http.Error(w, "Invalid task format", http.StatusBadRequest)
@@ -267,14 +285,12 @@ func main() {
 	dagServer := NewDAGServer()
 	dagServer.nodeStatusCond = sync.NewCond(&sync.Mutex{})
 
-	// Add nodes and edges to the DAG server (for example)
 	dagServer.AddNode("start", "localhost:8081")
 	dagServer.AddNode("middle", "localhost:8082")
 	dagServer.AddNode("end", "localhost:8083")
 	dagServer.AddEdge("start", "middle")
 	dagServer.AddEdge("middle", "end")
 
-	// Start server to listen for nodes
 	go func() {
 		listener, err := net.Listen("tcp", ":8080")
 		if err != nil {
@@ -294,16 +310,8 @@ func main() {
 			go dagServer.RegisterNode(conn)
 		}
 	}()
-
-	// Wait for all nodes to be ready
 	go dagServer.WaitForNodes()
-
-	// Monitor node health in background
 	go dagServer.MonitorNodes()
-
-	// Start processing tasks when nodes are ready
 	go dagServer.ProcessTasks()
-
-	// Start HTTP API for task submission
 	dagServer.ServeAPI()
 }
