@@ -64,6 +64,63 @@ func (d *TaskManager) GetTask(nodeKey string) (*Task, bool) {
 	return task, ok
 }
 
+func (d *TaskManager) processSimpleEdge(ctx context.Context, targets []string, task *Task, result Result) Result {
+	for _, targetKey := range targets {
+		nextResult := d.processTask(ctx, task.ID, targetKey, result.Payload)
+		if nextResult.Error != nil {
+			return nextResult
+		}
+		task.Results[targetKey] = nextResult.Payload
+		result = nextResult
+	}
+	return result
+}
+
+func (d *TaskManager) processLoopEdge(ctx context.Context, targets []string, task *Task, result Result, nodeKey string) Result {
+	var items []json.RawMessage
+	if err := json.Unmarshal(result.Payload, &items); err != nil {
+		return Result{Error: fmt.Errorf("expected array for LoopEdge: %v", err)}
+	}
+	var aggregatedResults []json.RawMessage
+	for _, item := range items {
+		for _, targetKey := range targets {
+			individualResult := d.processTask(ctx, task.ID, targetKey, item)
+			if individualResult.Error != nil {
+				return individualResult
+			}
+			aggregatedResults = append(aggregatedResults, individualResult.Payload)
+		}
+	}
+	aggregatedJSON, err := json.Marshal(aggregatedResults)
+	if err != nil {
+		return Result{Error: err}
+	}
+	task.Results[nodeKey] = aggregatedJSON
+	result.Payload = aggregatedJSON
+	return result
+}
+
+func (d *TaskManager) processConditionEdge(ctx context.Context, conditions map[ID]Condition, task *Task, result Result) Result {
+	for conditionID, conditionMap := range conditions {
+		conditionResult := d.processTask(ctx, task.ID, string(conditionID), result.Payload)
+		if conditionResult.Error != nil {
+			return conditionResult
+		}
+		nextNodeKey := conditionMap[conditionResult.Status]
+		if nextNodeKey == "" {
+			return Result{Error: fmt.Errorf("invalid condition status: %s", conditionResult.Status)}
+		}
+		nextNode := d.dag.Nodes[nextNodeKey]
+		nextResult := d.processNode(ctx, nextNode, d.AddTask(nextNodeKey, result.Payload))
+		if nextResult.Error != nil {
+			return nextResult
+		}
+		task.Results[nextNodeKey] = nextResult.Payload
+		result = nextResult
+	}
+	return result
+}
+
 func (d *TaskManager) processResult(ctx context.Context, result Result) Result {
 	task, ok := d.GetTask(result.NodeKey)
 	if task == nil || !ok {
@@ -78,56 +135,11 @@ func (d *TaskManager) processResult(ctx context.Context, result Result) Result {
 		if edge.Source == node.Key {
 			switch edge.EdgeType {
 			case SimpleEdge:
-				for _, targetKey := range edge.Targets {
-					targetNode := d.dag.Nodes[targetKey]
-					nextResult := d.processNode(ctx, targetNode, d.AddTask(targetKey, result.Payload))
-					if nextResult.Error != nil {
-						return nextResult
-					}
-					task.Results[targetKey] = nextResult.Payload
-					result = nextResult
-				}
+				result = d.processSimpleEdge(ctx, edge.Targets, task, result)
 			case LoopEdge:
-				var items []json.RawMessage
-				if err := json.Unmarshal(result.Payload, &items); err != nil {
-					return Result{Error: fmt.Errorf("expected array for LoopEdge: %v", err)}
-				}
-				var aggregatedResults []json.RawMessage
-				for _, item := range items {
-					for _, targetKey := range edge.Targets {
-						targetNode := d.dag.Nodes[targetKey]
-						individualResult := d.processNode(ctx, targetNode, d.AddTask(targetKey, item))
-						if individualResult.Error != nil {
-							return individualResult
-						}
-						aggregatedResults = append(aggregatedResults, individualResult.Payload)
-					}
-				}
-				aggregatedJSON, err := json.Marshal(aggregatedResults)
-				if err != nil {
-					return Result{Error: err}
-				}
-				task.Results[node.Key] = aggregatedJSON
-				result.Payload = aggregatedJSON
+				result = d.processLoopEdge(ctx, edge.Targets, task, result, node.Key)
 			case ConditionEdge:
-				for conditionID, conditionMap := range edge.Conditions {
-					conditionNode := d.dag.Nodes[string(conditionID)]
-					conditionResult := d.processNode(ctx, conditionNode, d.AddTask(string(conditionID), result.Payload))
-					if conditionResult.Error != nil {
-						return conditionResult
-					}
-					nextNodeKey := conditionMap[conditionResult.Status]
-					if nextNodeKey == "" {
-						return Result{Error: fmt.Errorf("invalid condition status: %s", conditionResult.Status)}
-					}
-					nextNode := d.dag.Nodes[nextNodeKey]
-					nextResult := d.processNode(ctx, nextNode, d.AddTask(nextNodeKey, result.Payload))
-					if nextResult.Error != nil {
-						return nextResult
-					}
-					task.Results[nextNodeKey] = nextResult.Payload
-					result = nextResult
-				}
+				result = d.processConditionEdge(ctx, edge.Conditions, task, result)
 			}
 		}
 	}
