@@ -40,7 +40,7 @@ type DAG struct {
 	Edges       []Edge
 	taskManager map[string]*TaskManager
 	mu          sync.RWMutex
-	startNode   *Node
+	StartNode   string
 }
 
 func New() *DAG {
@@ -59,7 +59,7 @@ func (d *DAG) AddNode(key, label string, handler Handler, firstNode ...bool) {
 		Handler: handler,
 	}
 	if len(firstNode) > 0 && firstNode[0] {
-		d.startNode = node
+		d.StartNode = key
 	}
 	d.Nodes[key] = node
 }
@@ -83,34 +83,40 @@ func (d *DAG) ProcessTask(ctx context.Context, payload json.RawMessage) Result {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	taskManager := NewTaskManager(d)
-	startNode := d.getStartNode()
-	if startNode == nil {
+	startNodeKey, ok := d.FirstNode()
+	if startNodeKey == "" || !ok {
 		return Result{Error: fmt.Errorf("no start node found")}
 	}
 	taskID := NewID()
 	d.taskManager[taskID] = taskManager
-	return taskManager.processTask(ctx, taskID, startNode.Key, payload)
+	return taskManager.processTask(ctx, taskID, startNodeKey, payload)
 }
 
-func (d *DAG) getStartNode() *Node {
-	if d.startNode != nil {
-		return d.startNode
+func (d *DAG) FirstNode() (string, bool) {
+	if d.StartNode != "" {
+		return d.StartNode, true
 	}
-	for _, node := range d.Nodes {
-		if d.isStartNode(node.Key) {
-			return node
-		}
+	inDegree := make(map[string]int)
+	for id := range d.Nodes {
+		inDegree[id] = 0
 	}
-	return nil
-}
-
-func (d *DAG) isStartNode(nodeKey string) bool {
 	for _, edge := range d.Edges {
-		for _, target := range edge.Targets {
-			if target == nodeKey {
-				return false
+		for _, outNode := range edge.Targets {
+			inDegree[outNode]++
+		}
+		if edge.EdgeType == ConditionEdge {
+			for id, condition := range edge.Conditions {
+				inDegree[string(id)]++
+				for _, outNode := range condition {
+					inDegree[outNode]++
+				}
 			}
 		}
 	}
-	return true
+	for n, count := range inDegree {
+		if count == 0 {
+			return n, true
+		}
+	}
+	return "", false
 }

@@ -114,8 +114,7 @@ func (d *TaskManager) processConditionEdge(ctx context.Context, conditions map[I
 		if nextNodeKey == "" {
 			return Result{Error: fmt.Errorf("invalid condition status: %s", conditionResult.Status)}
 		}
-		nextNode := d.dag.Nodes[nextNodeKey]
-		nextResult := d.processNode(ctx, nextNode, d.AddTask(nextNodeKey, result.Payload))
+		nextResult := d.processTask(ctx, task.ID, nextNodeKey, result.Payload)
 		if nextResult.Error != nil {
 			return nextResult
 		}
