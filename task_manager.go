@@ -19,14 +19,14 @@ type Task struct {
 	ID      string
 	NodeKey string
 	Payload json.RawMessage
-	Results map[string]json.RawMessage
+	Results map[string]Result
 }
 
 func NewTask(nodeKey string, payload json.RawMessage, id ...string) *Task {
 	task := &Task{
 		NodeKey: nodeKey,
 		Payload: payload,
-		Results: make(map[string]json.RawMessage),
+		Results: make(map[string]Result),
 	}
 	if len(id) > 0 && id[0] != "" {
 		task.ID = id[0]
@@ -70,7 +70,7 @@ func (d *TaskManager) processSimpleEdge(ctx context.Context, targets []string, t
 		if nextResult.Error != nil {
 			return nextResult
 		}
-		task.Results[targetKey] = nextResult.Payload
+		task.Results[targetKey] = nextResult
 		result = nextResult
 	}
 	return result
@@ -95,7 +95,11 @@ func (d *TaskManager) processLoopEdge(ctx context.Context, targets []string, tas
 	if err != nil {
 		return Result{Error: err}
 	}
-	task.Results[nodeKey] = aggregatedJSON
+	task.Results[nodeKey] = Result{
+		TaskID:  task.ID,
+		NodeKey: nodeKey,
+		Payload: aggregatedJSON,
+	}
 	result.Payload = aggregatedJSON
 	return result
 }
@@ -115,7 +119,7 @@ func (d *TaskManager) processConditionEdge(ctx context.Context, conditions map[I
 		if nextResult.Error != nil {
 			return nextResult
 		}
-		task.Results[nextNodeKey] = nextResult.Payload
+		task.Results[nextNodeKey] = nextResult
 		result = nextResult
 	}
 	return result
@@ -130,7 +134,7 @@ func (d *TaskManager) processResult(ctx context.Context, result Result) Result {
 	if node == nil || !ok {
 		return Result{Error: fmt.Errorf("node not found: %s", result.TaskID)}
 	}
-	task.Results[node.Key] = result.Payload
+	task.Results[node.Key] = result
 	for _, edge := range d.dag.Edges {
 		if edge.Source == node.Key {
 			switch edge.EdgeType {
