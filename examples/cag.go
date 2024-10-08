@@ -47,22 +47,16 @@ func handler3(ctx context.Context, task *v2.Task) v2.Result {
 }
 
 func main() {
-	taskManager := v2.NewTaskManager()
-	taskManager.AddNode("A", handler1)
-	taskManager.AddNode("B", handler2)
-	taskManager.AddNode("C", handler3)
-	taskManager.AddEdge("A", "B", v2.LoopEdge)
-	taskManager.AddEdge("B", "C", v2.SimpleEdge)
+	dag := v2.NewDAG()
+	dag.AddNode("A", handler1)
+	dag.AddNode("B", handler2)
+	dag.AddNode("C", handler3)
+	dag.AddEdge("A", "B", v2.LoopEdge)
+	dag.AddEdge("B", "C", v2.SimpleEdge)
 	initialPayload, _ := json.Marshal([]map[string]any{
 		{"user_id": 1, "age": 12},
 		{"user_id": 2, "age": 34},
 	})
-	task := &v2.Task{
-		ID:      "Task1",
-		NodeKey: "A",
-		Payload: initialPayload,
-		Results: make(map[string]v2.Result),
-	}
-	rs := taskManager.ProcessTask(context.Background(), "A", task)
+	rs := dag.ProcessTask(context.Background(), "A", initialPayload)
 	fmt.Println(string(rs.Payload))
 }
