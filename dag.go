@@ -21,6 +21,7 @@ type Node struct {
 	Label   string
 	Key     string
 	Handler Handler
+	edges   []Edge
 }
 
 type Condition map[string]string
@@ -77,6 +78,9 @@ func (d *DAG) AddEdge(label string, edgeType EdgeType, source string, targets []
 		edge.Conditions = conditions[0]
 	}
 	d.Edges = append(d.Edges, edge)
+	if node, ok := d.Nodes[edge.Source]; ok {
+		node.edges = append(node.edges, edge)
+	}
 }
 
 func (d *DAG) ProcessTask(ctx context.Context, payload json.RawMessage) Result {
