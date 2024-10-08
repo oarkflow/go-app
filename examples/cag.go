@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
 	v2 "github.com/oarkflow/dag/v2"
 )
 
-func handler1(task *v2.Task) v2.Result {
+func handler1(ctx context.Context, task *v2.Task) v2.Result {
 	return v2.Result{
 		TaskID:  task.ID,
 		NodeKey: "A",
@@ -16,7 +17,7 @@ func handler1(task *v2.Task) v2.Result {
 	}
 }
 
-func handler2(task *v2.Task) v2.Result {
+func handler2(ctx context.Context, task *v2.Task) v2.Result {
 	var user map[string]any
 	json.Unmarshal(task.Payload, &user)
 	return v2.Result{
@@ -27,7 +28,7 @@ func handler2(task *v2.Task) v2.Result {
 	}
 }
 
-func handler3(task *v2.Task) v2.Result {
+func handler3(ctx context.Context, task *v2.Task) v2.Result {
 	var user map[string]any
 	json.Unmarshal(task.Payload, &user)
 	age := int(user["age"].(float64))
@@ -62,6 +63,6 @@ func main() {
 		Payload: initialPayload,
 		Results: make(map[string]v2.Result),
 	}
-	rs := taskManager.ProcessTask("A", task)
+	rs := taskManager.ProcessTask(context.Background(), "A", task)
 	fmt.Println(string(rs.Payload))
 }

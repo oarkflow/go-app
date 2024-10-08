@@ -1,12 +1,13 @@
 package v2
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
 )
 
-type Handler func(task *Task) Result
+type Handler func(ctx context.Context, task *Task) Result
 
 type Result struct {
 	TaskID  string          `json:"task_id"`
@@ -83,54 +84,58 @@ func (tm *TaskManager) AddEdge(from, to string, edgeType EdgeType) {
 	})
 }
 
-func (tm *TaskManager) ProcessTask(node string, task *Task) Result {
+func (tm *TaskManager) ProcessTask(ctx context.Context, node string, task *Task) Result {
 	startNode, ok := tm.Nodes[node]
 	if !ok {
 		return Result{Error: fmt.Errorf("node %s not found", node)}
 	}
 	tm.wg.Add(1)
-	go tm.processNode(startNode, task, nil)
+	go tm.processNode(ctx, startNode, task, nil)
 	go func() {
 		tm.wg.Wait()
 		close(tm.done)
 	}()
-	<-tm.done
-	tm.mutex.Lock()
-	defer tm.mutex.Unlock()
-	if len(tm.finalResults) == 1 {
-		return tm.callback(tm.finalResults[0])
+	select {
+	case <-ctx.Done():
+		return Result{Error: ctx.Err()}
+	case <-tm.done:
+		tm.mutex.Lock()
+		defer tm.mutex.Unlock()
+		if len(tm.finalResults) == 1 {
+			return tm.callback(tm.finalResults[0])
+		}
+		return tm.callback(tm.finalResults)
 	}
-	return tm.callback(tm.finalResults)
 }
 
 func (tm *TaskManager) callback(results any) Result {
 	var rs Result
 	switch res := results.(type) {
 	case []Result:
-		finalUsers := make([]map[string]any, 0)
+		aggregatedOutput := make([]json.RawMessage, 0)
 		for _, result := range res {
-			var user map[string]any
-			err := json.Unmarshal(result.Payload, &user)
+			var item json.RawMessage
+			err := json.Unmarshal(result.Payload, &item)
 			if err != nil {
 				rs.Error = err
 				return rs
 			}
-			finalUsers = append(finalUsers, user)
+			aggregatedOutput = append(aggregatedOutput, item)
 		}
-		finalOutput, err := json.Marshal(finalUsers)
+		finalOutput, err := json.Marshal(aggregatedOutput)
 		if err != nil {
 			rs.Error = err
 			return rs
 		}
 		rs.Payload = finalOutput
 	case Result:
-		var user map[string]any
-		err := json.Unmarshal(res.Payload, &user)
+		var item json.RawMessage
+		err := json.Unmarshal(res.Payload, &item)
 		if err != nil {
 			rs.Error = err
 			return rs
 		}
-		finalOutput, err := json.Marshal(user)
+		finalOutput, err := json.Marshal(item)
 		if err != nil {
 			rs.Error = err
 			return rs
@@ -140,21 +145,29 @@ func (tm *TaskManager) callback(results any) Result {
 	return rs
 }
 
-func (tm *TaskManager) appendResult(result Result) {
+func (tm *TaskManager) appendFinalResult(result Result) {
 	tm.mutex.Lock()
 	tm.finalResults = append(tm.finalResults, result)
 	tm.mutex.Unlock()
 }
 
-func (tm *TaskManager) processNode(node *Node, task *Task, parentNode *Node) {
+func (tm *TaskManager) processNode(ctx context.Context, node *Node, task *Task, parentNode *Node) {
 	defer tm.wg.Done()
-	result := node.handler(task)
+	var result Result
+	select {
+	case <-ctx.Done():
+		result = Result{TaskID: task.ID, NodeKey: node.Key, Error: ctx.Err()}
+		tm.appendFinalResult(result)
+		return
+	default:
+		result = node.handler(ctx, task)
+	}
 	tm.mutex.Lock()
 	task.Results[node.Key] = result
 	tm.mutex.Unlock()
 	if len(node.Edges) == 0 {
 		if parentNode != nil {
-			tm.appendResult(result)
+			tm.appendFinalResult(result)
 		}
 		return
 	}
@@ -171,21 +184,21 @@ func (tm *TaskManager) processNode(node *Node, task *Task, parentNode *Node) {
 					Results: task.Results,
 				}
 				tm.wg.Add(1)
-				go tm.processNode(edge.To, loopTask, node)
+				go tm.processNode(ctx, edge.To, loopTask, node)
 			}
 		case ConditionEdge:
 			if edge.Condition(result) && edge.To != nil {
 				tm.wg.Add(1)
-				go tm.processNode(edge.To, task, node)
+				go tm.processNode(ctx, edge.To, task, node)
 			} else if parentNode != nil {
-				tm.appendResult(result)
+				tm.appendFinalResult(result)
 			}
 		case SimpleEdge:
 			if edge.To != nil {
 				tm.wg.Add(1)
-				go tm.processNode(edge.To, task, node)
+				go tm.processNode(ctx, edge.To, task, node)
 			} else if parentNode != nil {
-				tm.appendResult(result)
+				tm.appendFinalResult(result)
 			}
 		}
 	}
