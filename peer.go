@@ -780,7 +780,6 @@ func processSDPAnswerFull(answerCode, encodedAnswer string) {
 			return
 		}
 		fmt.Printf("[WebRTC] WebRTC connection established for offer %s!\n", oc)
-		delete(pendingOffers, oc)
 		break
 	}
 }
