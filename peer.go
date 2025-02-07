@@ -137,7 +137,7 @@ func processCommand(line string, h host.Host) {
 		currentRoom = room
 		code := generateCode(6)
 		roomCodes[code] = room
-		fmt.Printf("Room '%s' created. Unique room code: %s (share this code to invite others)\n", room, code)
+		fmt.Printf("Room '%s' created. Unique room code: %s (share this code privately to invite others)\n", room, code)
 	case strings.HasPrefix(line, "/joinroom "):
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/joinroom "))
 		room, ok := roomCodes[code]
@@ -563,8 +563,7 @@ func sendFileCode(filepathArg string) {
 		filepath: filepathArg,
 		sender:   localPeerID,
 	}
-	fmt.Printf("File sharing code for '%s': %s (share this code with recipients)\n", baseName, code)
-
+	fmt.Printf("File sharing code for '%s': %s (share this code privately with recipients)\n", baseName, code)
 }
 
 func sendFileForCode(h host.Host, target string, share fileShare) {
@@ -708,7 +707,7 @@ func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 		return
 	}
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		fmt.Printf("[WebRTC] Data channel '%s'-%d opened on answerer side.\n", dc.Label(), dc.ID())
+		fmt.Printf("[WebRTC] Data channel '%s'-[%d] opened on answerer side.\n", dc.Label(), dc.ID())
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			fmt.Printf("[WebRTC] Message on data channel (answerer): %s\n", string(msg.Data))
 		})
@@ -781,6 +780,7 @@ func processSDPAnswerFull(answerCode, encodedAnswer string) {
 			return
 		}
 		fmt.Printf("[WebRTC] WebRTC connection established for offer %s!\n", oc)
+		delete(pendingOffers, oc)
 		break
 	}
 }
