@@ -24,26 +24,21 @@ const (
 	Rendezvous = "p2p-chat-file-rendezvous"
 )
 
-// discoveryNotifee is used by mDNS to notify us about peers.
 type discoveryNotifee struct {
 	h   host.Host
 	ctx context.Context
 }
 
-// fileRequest carries an incoming file transfer request.
 type fileRequest struct {
 	stream   network.Stream
 	fileName string
 }
 
 var (
-	// inputChan receives all lines typed by the user.
-	inputChan = make(chan string)
-	// fileRequestChan receives file transfer requests from incoming streams.
+	inputChan       = make(chan string)
 	fileRequestChan = make(chan fileRequest)
-	// currentDir is the save directory (default is the current directory).
-	currentDir = "./"
-	mu         sync.Mutex
+	currentDir      = "./files"
+	mu              sync.Mutex
 )
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
@@ -63,38 +58,26 @@ func main() {
 		log.Fatal(err)
 	}
 	defer h.Close()
-
 	fmt.Printf("[🔗] Peer ID: %s\n", h.ID())
 	for _, addr := range h.Addrs() {
 		fmt.Printf("[🌐] Listening on: %s/p2p/%s\n", addr, h.ID())
 	}
-
-	// Start mDNS discovery.
 	mdnsService := mdns.NewMdnsService(h, Rendezvous, &discoveryNotifee{h: h, ctx: ctx})
 	if err := mdnsService.Start(); err != nil {
 		log.Fatal(err)
 	}
-
-	// Set stream handler.
 	h.SetStreamHandler(ProtocolID, handleStream)
-
-	// Start a goroutine to read user input and send to inputChan.
 	go readInput()
-
-	// Main loop: process file requests and user commands from the same input channel.
 	for {
 		select {
-		// A file request from a remote peer.
 		case req := <-fileRequestChan:
 			processFileRequest(req)
-		// A regular user command.
 		case line := <-inputChan:
 			processCommand(line, h)
 		}
 	}
 }
 
-// readInput continuously reads from os.Stdin and sends each line to inputChan.
 func readInput() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -106,9 +89,6 @@ func readInput() {
 	}
 }
 
-// handleStream processes incoming streams.
-// For chat messages, it reads the message and closes the stream.
-// For file transfers, it pushes a fileRequest into fileRequestChan without closing the stream.
 func handleStream(s network.Stream) {
 	reader := bufio.NewReader(s)
 	data, err := reader.ReadString('\n')
@@ -118,7 +98,6 @@ func handleStream(s network.Stream) {
 		return
 	}
 	data = strings.TrimSpace(data)
-
 	if strings.HasPrefix(data, "chat:") {
 		fmt.Printf("[💬] %s: %s\n", s.Conn().RemotePeer(), strings.TrimPrefix(data, "chat:"))
 		s.Close()
@@ -130,13 +109,10 @@ func handleStream(s network.Stream) {
 			return
 		}
 		fileName := strings.TrimSpace(parts[1])
-		// Do not close the stream: main loop will handle it after the file transfer.
 		fileRequestChan <- fileRequest{stream: s, fileName: fileName}
 	}
 }
 
-// processFileRequest prompts the user to accept or reject the incoming file.
-// It uses the shared inputChan for reading the user's response.
 func processFileRequest(req fileRequest) {
 	fmt.Printf("\nIncoming file request from %s: %s\n", req.stream.Conn().RemotePeer(), req.fileName)
 	fmt.Print("Accept file transfer? (y/n): ")
@@ -155,9 +131,7 @@ func processFileRequest(req fileRequest) {
 		saveDir = currentDir
 		mu.Unlock()
 	}
-	// Construct the full path.
 	savePath := filepath.Join(saveDir, req.fileName)
-
 	file, err := os.Create(savePath)
 	if err != nil {
 		fmt.Printf("[⚠️] Error creating file: %v\n", err)
@@ -177,7 +151,6 @@ func processFileRequest(req fileRequest) {
 	fmt.Printf("[✅] File received: %s\n", savePath)
 }
 
-// processCommand handles commands from the user.
 func processCommand(line string, h host.Host) {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -185,15 +158,14 @@ func processCommand(line string, h host.Host) {
 	}
 	switch {
 	case strings.HasPrefix(line, "/chat "):
-		message := strings.TrimPrefix(line, "/chat ")
+		message := strings.TrimSpace(strings.TrimPrefix(line, "/chat "))
 		sendMessage(h, message)
 	case strings.HasPrefix(line, "/sendfile "):
-		filename := strings.TrimPrefix(line, "/sendfile ")
+		filename := strings.TrimSpace(strings.TrimPrefix(line, "/sendfile "))
 		sendFile(h, filename)
 	case strings.HasPrefix(line, "/setdir "):
-		dir := strings.TrimPrefix(line, "/setdir ")
 		mu.Lock()
-		currentDir = strings.TrimSpace(dir)
+		currentDir = strings.TrimSpace(strings.TrimPrefix(line, "/setdir "))
 		mu.Unlock()
 		fmt.Printf("[📂] Save directory set to: %s\n", currentDir)
 	case line == "/peers":
@@ -206,7 +178,6 @@ func processCommand(line string, h host.Host) {
 	}
 }
 
-// sendMessage sends a chat message to all connected peers.
 func sendMessage(h host.Host, message string) {
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
@@ -216,7 +187,6 @@ func sendMessage(h host.Host, message string) {
 	}
 }
 
-// sendFile sends a file to all connected peers.
 func sendFile(h host.Host, filename string) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -224,7 +194,6 @@ func sendFile(h host.Host, filename string) {
 		return
 	}
 	defer file.Close()
-
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
 			fmt.Printf("[📂] Sending file: %s\n", filename)
@@ -232,13 +201,12 @@ func sendFile(h host.Host, filename string) {
 			s.Write([]byte("file:" + filename + "\n"))
 			io.Copy(s, file)
 			s.Close()
-			// Reset file pointer for subsequent peers.
+
 			file.Seek(0, 0)
 		}
 	}
 }
 
-// listPeers prints all connected peers.
 func listPeers(h host.Host) {
 	fmt.Println("[🌐] Connected peers:")
 	for _, p := range h.Peerstore().Peers() {
