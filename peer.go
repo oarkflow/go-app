@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/libp2p/go-libp2p"
@@ -20,6 +21,10 @@ import (
 const (
 	ProtocolID = "/p2p-chat-file/1.0.0"
 	Rendezvous = "p2p-chat-file-rendezvous"
+)
+
+var (
+	currentDir = "./"
 )
 
 type discoveryNotifee struct {
@@ -72,24 +77,9 @@ func handleStream(s network.Stream) {
 	} else if strings.HasPrefix(data, "file:") {
 		parts := strings.SplitN(data, ":", 2)
 		fileName := strings.TrimSpace(parts[1])
-		fmt.Printf("\nIncoming file request: %s\nAccept? (y/n): ", fileName)
+		fmt.Printf("\nIncoming file request: %s\n", fileName)
 
-		reader := bufio.NewReader(os.Stdin)
-		resp, _ := reader.ReadString('\n')
-		resp = strings.TrimSpace(resp)
-
-		if resp != "y" {
-			fmt.Println("File transfer rejected.")
-			return
-		}
-
-		fmt.Print("Enter save path (or press Enter for default): ")
-		savePath, _ := reader.ReadString('\n')
-		savePath = strings.TrimSpace(savePath)
-		if savePath == "" {
-			savePath = fileName
-		}
-
+		savePath := filepath.Join(currentDir, strings.TrimSpace(fileName))
 		fmt.Printf("[📂] Receiving file: %s\n", fileName)
 		file, err := os.Create(savePath)
 		if err != nil {
@@ -111,7 +101,7 @@ func handleStream(s network.Stream) {
 func handleUserInput(h host.Host) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("Command (/chat message, /sendfile filename, /peers, /exit): ")
+		fmt.Print("Command (/chat message, /send-file filename, /set-dir path, /peers, /exit): ")
 		scanner.Scan()
 		input := scanner.Text()
 
@@ -119,9 +109,14 @@ func handleUserInput(h host.Host) {
 		case strings.HasPrefix(input, "/chat "):
 			message := strings.TrimPrefix(input, "/chat ")
 			sendMessage(h, message)
-		case strings.HasPrefix(input, "/sendfile "):
-			filename := strings.TrimPrefix(input, "/sendfile ")
+		case strings.HasPrefix(input, "/set-dir "):
+			currentDir = strings.TrimSpace(strings.TrimPrefix(input, "/set-dir "))
+			os.MkdirAll(currentDir, os.ModePerm)
+			fmt.Printf("[✅] Current directory set to: %s\n> ", currentDir)
+		case strings.HasPrefix(input, "/send-file "):
+			filename := strings.TrimPrefix(input, "/send-file ")
 			sendFile(h, filename)
+			fmt.Printf("[✅] File sent: %s\n> ", filename)
 		case input == "/peers":
 			listPeers(h)
 		case input == "/exit":
@@ -143,6 +138,7 @@ func sendMessage(h host.Host, message string) {
 }
 
 func sendFile(h host.Host, filename string) {
+	fileName := filepath.Base(filename)
 	file, err := os.Open(filename)
 	if err != nil {
 		fmt.Println("[⚠️] Error opening file.")
@@ -152,7 +148,7 @@ func sendFile(h host.Host, filename string) {
 
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
-			s.Write([]byte("file:" + filename + "\n"))
+			s.Write([]byte("file:" + fileName + "\n"))
 			io.Copy(s, file)
 			s.Close()
 		}
