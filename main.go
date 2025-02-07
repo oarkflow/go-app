@@ -14,6 +14,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", os.Args[0], err)
 		os.Exit(1)
 	}
+	fmt.Println(doc.Print())
 }
 
 var config = `

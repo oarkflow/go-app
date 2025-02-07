@@ -9,6 +9,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"github.com/oarkflow/dag/qr"
+	"github.com/oarkflow/dag/qrcode"
 	"io"
 	"log"
 	"math/big"
@@ -27,37 +29,29 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-// Protocol and rendezvous parameters
 const (
 	ProtocolID = "/p2p-chat-file/1.0.0"
 	Rendezvous = "p2p-chat-file-rendezvous"
 )
 
-// Hard-coded secret used for encrypting/decrypting SDP (for demonstration)
 const fixedSecret = "MY_SECRET_KEY"
 
-// ------------------ Global State ------------------
 var (
-	// Chat/room and file sharing state
 	username        = "Anonymous"
 	currentRoom     = "public"
 	rooms           = map[string]bool{"public": true}
 	adminRooms      = map[string]bool{"public": false}
-	roomCodes       = make(map[string]string) // room join codes (kept private)
+	roomCodes       = make(map[string]string)
 	localPeerID     string
-	fileShares      = make(map[string]fileShare) // file share info keyed by file code
+	fileShares      = make(map[string]fileShare)
 	inputChan       = make(chan string)
 	fileRequestChan = make(chan fileRequest)
 	currentDir      = "./files"
 	mu              sync.Mutex
-
-	// WebRTC negotiation state
-	// pendingOffer holds the offer info when this peer creates an offer.
-	pendingOffer *webrtcOfferInfo
-	webrtcMu     sync.Mutex
+	pendingOffer    *webrtcOfferInfo
+	webrtcMu        sync.Mutex
 )
 
-// ------------------ Structures ------------------
 type fileShare struct {
 	filename string
 	filepath string
@@ -69,18 +63,14 @@ type fileRequest struct {
 	fileName string
 }
 
-// webrtcOfferInfo holds our offer (if we create one) for later finalization.
 type webrtcOfferInfo struct {
-	sdp string
-	pc  *webrtc.PeerConnection
-	dc  *webrtc.DataChannel
-	// secret is the (hard-coded) secret used for encryption/decryption.
-	secret string
-	// offerCode is the URL-friendly encrypted SDP that is printed.
+	sdp       string
+	pc        *webrtc.PeerConnection
+	dc        *webrtc.DataChannel
+	secret    string
 	offerCode string
 }
 
-// ------------------ MDNS Discovery ------------------
 type discoveryNotifee struct {
 	h   host.Host
 	ctx context.Context
@@ -96,15 +86,15 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 }
 
-// ------------------ Main ------------------
 func main() {
 	ctx := context.Background()
 	h, err := libp2p.New()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer h.Close()
-
+	defer func() {
+		_ = h.Close()
+	}()
 	localPeerID = h.ID().ShortString()
 	fmt.Printf("[🔗] Peer ID: %s\n", localPeerID)
 	for _, addr := range h.Addrs() {
@@ -115,7 +105,6 @@ func main() {
 	if err := mdnsService.Start(); err != nil {
 		log.Fatal(err)
 	}
-
 	h.SetStreamHandler(ProtocolID, handleStream(h))
 	go readInput()
 	for {
@@ -139,20 +128,16 @@ func readInput() {
 	}
 }
 
-// ------------------ Command Processing ------------------
 func processCommand(line string, h host.Host) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return
 	}
 	switch {
-	// Change username
 	case strings.HasPrefix(line, "/username "):
 		newName := strings.TrimSpace(strings.TrimPrefix(line, "/username "))
 		username = newName
 		fmt.Printf("Username changed to %s\n", username)
-
-	// Switch room (only if member)
 	case strings.HasPrefix(line, "/room "):
 		room := strings.TrimSpace(strings.TrimPrefix(line, "/room "))
 		if _, ok := rooms[room]; ok {
@@ -161,8 +146,6 @@ func processCommand(line string, h host.Host) {
 		} else {
 			fmt.Printf("You are not a member of room %s. Use /joinroom <code> or /createroom.\n", room)
 		}
-
-	// Create room (you become admin) – room join code is generated but not broadcast
 	case strings.HasPrefix(line, "/createroom "):
 		room := strings.TrimSpace(strings.TrimPrefix(line, "/createroom "))
 		rooms[room] = true
@@ -171,8 +154,6 @@ func processCommand(line string, h host.Host) {
 		code := generateCode(6)
 		roomCodes[code] = room
 		fmt.Printf("Room '%s' created. Unique room code: %s (share this code privately to invite others)\n", room, code)
-
-	// Join room via secret code (code is not broadcast)
 	case strings.HasPrefix(line, "/joinroom "):
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/joinroom "))
 		room, ok := roomCodes[code]
@@ -184,8 +165,6 @@ func processCommand(line string, h host.Host) {
 			fmt.Printf("Joined room %s\n", room)
 			sendBroadcast(h, fmt.Sprintf("join:%s:%s\n", room, username))
 		}
-
-	// Invite a peer to a room (only admin)
 	case strings.HasPrefix(line, "/invite "):
 		parts := strings.Fields(line)
 		if len(parts) < 3 {
@@ -200,8 +179,6 @@ func processCommand(line string, h host.Host) {
 				fmt.Printf("Invite sent to %s for room %s\n", target, room)
 			}
 		}
-
-	// Kick a peer from a room (only admin)
 	case strings.HasPrefix(line, "/kick "):
 		parts := strings.Fields(line)
 		if len(parts) < 3 {
@@ -216,8 +193,6 @@ func processCommand(line string, h host.Host) {
 				fmt.Printf("Kick message sent for %s from room %s\n", target, room)
 			}
 		}
-
-	// Private message
 	case strings.HasPrefix(line, "/msg "):
 		parts := strings.SplitN(line, " ", 3)
 		if len(parts) < 3 {
@@ -227,8 +202,6 @@ func processCommand(line string, h host.Host) {
 			msg := parts[2]
 			sendToPeer(h, target, fmt.Sprintf("private:%s:%s:%s\n", target, username, msg))
 		}
-
-	// Chat to room (public if "public"; group otherwise)
 	case strings.HasPrefix(line, "/chat "):
 		msg := strings.TrimSpace(strings.TrimPrefix(line, "/chat "))
 		if currentRoom == "public" {
@@ -236,58 +209,36 @@ func processCommand(line string, h host.Host) {
 		} else {
 			sendBroadcast(h, fmt.Sprintf("chat:group:%s:%s:%s\n", currentRoom, username, msg))
 		}
-
-	// File transfer: direct send (streamed to all peers)
 	case strings.HasPrefix(line, "/sendfile "):
 		filename := strings.TrimSpace(strings.TrimPrefix(line, "/sendfile "))
 		sendFile(h, filename)
-
-	// File sharing via code
 	case strings.HasPrefix(line, "/sendfilecode "):
 		filepathArg := strings.TrimSpace(strings.TrimPrefix(line, "/sendfilecode "))
 		sendFileCode(filepathArg)
-
-	// Request a file via its share code
 	case strings.HasPrefix(line, "/getfile "):
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/getfile "))
 		sendBroadcast(h, fmt.Sprintf("getfile:%s:%s\n", code, localPeerID))
-
-	// Set local file save directory
 	case strings.HasPrefix(line, "/setdir "):
 		dir := strings.TrimSpace(strings.TrimPrefix(line, "/setdir "))
 		mu.Lock()
 		currentDir = dir
 		mu.Unlock()
 		fmt.Printf("Save directory set to: %s\n", currentDir)
-
-	// List connected peers
 	case line == "/peers":
 		listPeers(h)
-
-	// Exit the application
 	case line == "/exit":
 		fmt.Println("Exiting...")
 		os.Exit(0)
-
-	// ------------------ WebRTC Negotiation Commands ------------------
-	// Create a WebRTC offer. (No target peer; the SDP offer is encrypted as a URL‑friendly value.)
-	// Usage: /webrtc-offer
 	case line == "/webrtc-offer":
-		webrtcOffer(h)
-
-	// Accept an offer by providing the offer code.
-	// Usage: /webrtc-accept <offerCode>
+		webrtcOffer()
 	case strings.HasPrefix(line, "/webrtc-accept "):
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
 			fmt.Println("Usage: /webrtc-accept <offerCode>")
 		} else {
 			offerCode := parts[1]
-			webrtcAccept(offerCode, h)
+			webrtcAccept(offerCode)
 		}
-
-	// Finalize the offer by providing the answer code.
-	// Usage: /webrtc-finalize <answerCode>
 	case strings.HasPrefix(line, "/webrtc-finalize "):
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
@@ -296,7 +247,6 @@ func processCommand(line string, h host.Host) {
 			answerCode := parts[1]
 			webrtcFinalize(answerCode)
 		}
-
 	default:
 		fmt.Println("Invalid command.")
 	}
@@ -306,7 +256,7 @@ func sendBroadcast(h host.Host, msg string) {
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
 			_, _ = s.Write([]byte(msg))
-			s.Close()
+			_ = s.Close()
 		}
 	}
 }
@@ -316,7 +266,7 @@ func sendToPeer(h host.Host, target string, msg string) {
 		if p.ShortString() == target {
 			if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
 				_, _ = s.Write([]byte(msg))
-				s.Close()
+				_ = s.Close()
 			}
 		}
 	}
@@ -336,24 +286,22 @@ func generateCode(length int) string {
 	return string(result)
 }
 
-// ------------------ Stream Handler ------------------
 func handleStream(h host.Host) func(network.Stream) {
 	return func(s network.Stream) {
 		reader := bufio.NewReader(s)
 		data, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Println("[⚠️] Error reading stream:", err)
-			s.Close()
+			_ = s.Close()
 			return
 		}
 		data = strings.TrimSpace(data)
-		// (The normal chat, room, and file message handling remains unchanged.)
 		switch {
 		case strings.HasPrefix(data, "chat:"):
 			parts := strings.SplitN(data, ":", 5)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid chat message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			if parts[1] == "public" {
@@ -361,7 +309,7 @@ func handleStream(h host.Host) func(network.Stream) {
 			} else if parts[1] == "group" {
 				if len(parts) < 5 {
 					fmt.Println("[⚠️] Invalid group chat format.")
-					s.Close()
+					_ = s.Close()
 					return
 				}
 				roomName := parts[2]
@@ -369,55 +317,55 @@ func handleStream(h host.Host) func(network.Stream) {
 					fmt.Printf("[Group:%s] %s: %s\n", roomName, parts[3], parts[4])
 				}
 			}
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "private:"):
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid private message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fmt.Printf("[Private] %s: %s\n", parts[2], parts[3])
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "invite:"):
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid invite message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
 			inviter := parts[2]
 			fmt.Printf("[Invite] %s invited you to join room '%s'. To join, type: /joinroom <roomCode>\n", inviter, roomName)
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "roomcode:"):
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid roomcode message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
 			roomName := parts[2]
 			roomCodes[code] = roomName
 			fmt.Printf("[Room Code] Room '%s' is available with code: %s (created by %s)\n", roomName, code, parts[3])
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "join:"):
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid join message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
 			joiner := parts[2]
 			fmt.Printf("[Room %s] %s has joined.\n", roomName, joiner)
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "kick:"):
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid kick message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
@@ -431,12 +379,12 @@ func handleStream(h host.Host) func(network.Stream) {
 				}
 				fmt.Printf("You have been removed from room %s. Switched to public room.\n", roomName)
 			}
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "file:"):
 			parts := strings.SplitN(data, ":", 2)
 			if len(parts) < 2 {
 				fmt.Println("[⚠️] Invalid file request received.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fName := strings.TrimSpace(parts[1])
@@ -445,19 +393,19 @@ func handleStream(h host.Host) func(network.Stream) {
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid filecode message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
 			fName := parts[2]
 			sender := parts[3]
 			fmt.Printf("[File Share] File '%s' is available with code: %s from %s. Use /getfile %s to request it.\n", fName, code, sender, code)
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "getfile:"):
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid getfile message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
@@ -465,20 +413,20 @@ func handleStream(h host.Host) func(network.Stream) {
 			share, ok := fileShares[code]
 			if !ok {
 				fmt.Printf("[⚠️] No file share found for code %s\n", code)
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			if share.sender != localPeerID {
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			sendFileForCode(h, receiver, share)
-			s.Close()
+			_ = s.Close()
 		case strings.HasPrefix(data, "instantfile:"):
 			parts := strings.SplitN(data, ":", 2)
 			if len(parts) < 2 {
 				fmt.Println("[⚠️] Invalid instant file header.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fName := strings.TrimSpace(parts[1])
@@ -486,22 +434,21 @@ func handleStream(h host.Host) func(network.Stream) {
 			file, err := os.Create(savePath)
 			if err != nil {
 				fmt.Printf("[⚠️] Error creating file: %v\n", err)
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			_, _ = io.Copy(file, s)
-			file.Close()
-			s.Close()
+			_ = file.Close()
+			_ = s.Close()
 			fmt.Printf("Instant file received: %s\n", savePath)
-		// (For simplicity, the legacy WebRTC message types are not handled here.)
+
 		default:
 			fmt.Printf("[⚠️] Unknown message type: %s\n", data)
-			s.Close()
+			_ = s.Close()
 		}
 	}
 }
 
-// ------------------ File Transfer Functions ------------------
 func processFileRequest(req fileRequest) {
 	fmt.Printf("\nIncoming file request from %s: %s\n", req.stream.Conn().RemotePeer(), req.fileName)
 	fmt.Print("Accept file transfer? (y/n): ")
@@ -509,7 +456,7 @@ func processFileRequest(req fileRequest) {
 	answer = strings.TrimSpace(answer)
 	if strings.ToLower(answer) != "y" {
 		fmt.Println("❌ File transfer rejected.")
-		req.stream.Close()
+		_ = req.stream.Close()
 		return
 	}
 	fmt.Print("Enter save directory (or press Enter for default): ")
@@ -522,19 +469,19 @@ func processFileRequest(req fileRequest) {
 	file, err := os.Create(savePath)
 	if err != nil {
 		fmt.Printf("[⚠️] Error creating file: %v\n", err)
-		req.stream.Close()
+		_ = req.stream.Close()
 		return
 	}
 	fmt.Printf("[📂] Receiving file: %s\n", savePath)
 	_, err = io.Copy(file, req.stream)
 	if err != nil {
 		fmt.Printf("[⚠️] Error receiving file: %v\n", err)
-		file.Close()
-		req.stream.Close()
+		_ = file.Close()
+		_ = req.stream.Close()
 		return
 	}
-	file.Close()
-	req.stream.Close()
+	_ = file.Close()
+	_ = req.stream.Close()
 	fmt.Printf("[✅] File received: %s\n", savePath)
 }
 
@@ -544,15 +491,17 @@ func sendFile(h host.Host, filename string) {
 		fmt.Println("[⚠️] Error opening file.")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	baseName := filepath.Base(filename)
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
 			fmt.Printf("Sending file: %s\n", baseName)
 			_, _ = s.Write([]byte("file:" + baseName + "\n"))
 			_, _ = io.Copy(s, file)
-			s.Close()
-			file.Seek(0, 0)
+			_ = s.Close()
+			_, _ = file.Seek(0, 0)
 		}
 	}
 }
@@ -563,7 +512,9 @@ func sendFileCode(filepathArg string) {
 		fmt.Println("[⚠️] Error opening file.")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	baseName := filepath.Base(filepathArg)
 	code := generateCode(6)
 	fileShares[code] = fileShare{
@@ -586,12 +537,14 @@ func sendFileForCode(h host.Host, target string, share fileShare) {
 			f, err := os.Open(share.filepath)
 			if err != nil {
 				fmt.Printf("Error opening file for code transfer: %v\n", err)
-				s.Close()
+				_ = s.Close()
 				return
 			}
-			defer f.Close()
+			defer func() {
+				_ = f.Close()
+			}()
 			_, _ = io.Copy(s, f)
-			s.Close()
+			_ = s.Close()
 			fmt.Printf("File '%s' sent to peer %s\n", share.filename, target)
 			return
 		}
@@ -608,14 +561,11 @@ func listPeers(h host.Host) {
 	}
 }
 
-// ------------------ Encryption Utilities ------------------
-// deriveKey returns a 16-byte AES-128 key derived from the secret using SHA-256.
 func deriveKey(secret string) []byte {
 	hash := sha256.Sum256([]byte(secret))
 	return hash[:16]
 }
 
-// encrypt encrypts plaintext using AES-GCM and returns a URL-friendly Base64 string.
 func encrypt(plaintext, secret string) (string, error) {
 	key := deriveKey(secret)
 	block, err := aes.NewCipher(key)
@@ -631,11 +581,9 @@ func encrypt(plaintext, secret string) (string, error) {
 		return "", err
 	}
 	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	// Use URL-friendly encoding.
 	return base64.URLEncoding.EncodeToString(ciphertext), nil
 }
 
-// decrypt decrypts a URL-friendly Base64 string using AES-GCM.
 func decrypt(ciphertextB64, secret string) (string, error) {
 	key := deriveKey(secret)
 	ciphertext, err := base64.URLEncoding.DecodeString(ciphertextB64)
@@ -662,12 +610,7 @@ func decrypt(ciphertextB64, secret string) (string, error) {
 	return string(plaintext), nil
 }
 
-// ------------------ WebRTC Negotiation Functions ------------------
-
-// webrtcOffer creates a PeerConnection and DataChannel, creates an SDP offer,
-// encrypts the SDP using the fixed secret, saves the offer info for later finalization,
-// and prints the URL-friendly encrypted offer code.
-func webrtcOffer(h host.Host) {
+func webrtcOffer() {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 	}
@@ -715,12 +658,32 @@ func webrtcOffer(h host.Host) {
 	}
 	webrtcMu.Unlock()
 	fmt.Println("[WebRTC] Offer created.")
-	fmt.Printf("Copy and share this Offer Code (URL-friendly):\n%s\n", encryptedOffer)
+	qrc, err := qrcode.Encode(encryptedOffer)
+	if err != nil {
+		panic(err)
+	}
+	err = qrc.SaveAsPNG("offer.png")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Copy and share this offer.png\n")
 }
 
-// webrtcAccept takes an offer code (encrypted SDP offer), decrypts it using the fixed secret,
-// creates an answer, encrypts the answer SDP with the same secret, and prints the answer code.
-func webrtcAccept(offerCode string, h host.Host) {
+func webrtcAccept(image string) {
+	fi, err := os.Open(image)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer func() {
+		_ = fi.Close()
+	}()
+	qrmatrix, err := qr.Decode(fi)
+	if err != nil {
+		panic(err)
+		return
+	}
+	offerCode := strings.Trim(qrmatrix.Content, `"`)
 	sdpOffer, err := decrypt(offerCode, fixedSecret)
 	if err != nil {
 		fmt.Println("[WebRTC] Error decrypting offer. Verify that you copied the correct Offer Code and that the secret is correct.")
@@ -766,12 +729,33 @@ func webrtcAccept(offerCode string, h host.Host) {
 		fmt.Println("[WebRTC] Error encrypting answer:", err)
 		return
 	}
+	qrc, err := qrcode.Encode(encryptedAnswer)
+	if err != nil {
+		panic(err)
+	}
+	err = qrc.SaveAsPNG("answer.png")
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("[WebRTC] Answer created.")
-	fmt.Printf("Copy and share this Answer Code (URL-friendly) with the offerer:\n%s\n", encryptedAnswer)
+	fmt.Printf("Copy and share this answer.png\n")
 }
 
-// webrtcFinalize is run by the offerer to finalize the connection by processing the Answer Code.
-func webrtcFinalize(answerCode string) {
+func webrtcFinalize(image string) {
+	fi, err := os.Open(image)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer func() {
+		_ = fi.Close()
+	}()
+	qrmatrix, err := qr.Decode(fi)
+	if err != nil {
+		panic(err)
+		return
+	}
+	answerCode := strings.Trim(qrmatrix.Content, `"`)
 	webrtcMu.Lock()
 	defer webrtcMu.Unlock()
 	if pendingOffer == nil {
