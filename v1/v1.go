@@ -9,8 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"github.com/oarkflow/dag/qr"
-	"github.com/oarkflow/dag/qrcode"
 	"io"
 	"log"
 	"math/big"
@@ -18,6 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/oarkflow/dag/qr"
+	"github.com/oarkflow/dag/qrcode"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -50,6 +51,9 @@ var (
 	mu              sync.Mutex
 	pendingOffer    *webrtcOfferInfo
 	webrtcMu        sync.Mutex
+	// NEW: Maps for auto-webrtc handshake and active data channels.
+	pendingWrtc       = make(map[string]*webrtcOfferInfo)
+	webrtcConnections = make(map[string]*webrtc.DataChannel)
 )
 
 type fileShare struct {
@@ -239,6 +243,10 @@ func processCommand(line string, h host.Host) {
 			offerCode := parts[1]
 			webrtcAccept(offerCode)
 		}
+	case strings.HasPrefix(line, "/webrtc-peers"):
+		for p := range webrtcConnections {
+			fmt.Println("Peer", p)
+		}
 	case strings.HasPrefix(line, "/webrtc-finalize "):
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
@@ -246,6 +254,35 @@ func processCommand(line string, h host.Host) {
 		} else {
 			answerCode := parts[1]
 			webrtcFinalize(answerCode)
+		}
+	// NEW: Automatic WebRTC handshake command.
+	case strings.HasPrefix(line, "/webrtc-auto "):
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			fmt.Println("Usage: /webrtc-auto <peerID>")
+		} else {
+			target := parts[1]
+			webrtcAutoInitiate(h, target)
+		}
+	// NEW: Send message over an active WebRTC DataChannel.
+	case strings.HasPrefix(line, "/wrtc-msg "):
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) < 3 {
+			fmt.Println("Usage: /wrtc-msg <peerID> <message>")
+		} else {
+			target := parts[1]
+			msg := parts[2]
+			webrtcMu.Lock()
+			dc, ok := webrtcConnections[target]
+			webrtcMu.Unlock()
+			if !ok {
+				fmt.Printf("No active WebRTC connection to peer %s\n", target)
+			} else {
+				err := dc.SendText(fmt.Sprintf("[WebRTC] %s: %s", username, msg))
+				if err != nil {
+					fmt.Println("Error sending via WebRTC:", err)
+				}
+			}
 		}
 	default:
 		fmt.Println("Invalid command.")
@@ -441,7 +478,114 @@ func handleStream(h host.Host) func(network.Stream) {
 			_ = file.Close()
 			_ = s.Close()
 			fmt.Printf("Instant file received: %s\n", savePath)
-
+		// NEW: Automatic WebRTC handshake – Offer
+		case strings.HasPrefix(data, "wrtc-auto-offer:"):
+			parts := strings.SplitN(data, ":", 3)
+			if len(parts) < 3 {
+				fmt.Println("[WebRTC-Auto] Invalid auto offer message.")
+				_ = s.Close()
+				return
+			}
+			initiator := parts[1]
+			encryptedOffer := parts[2]
+			sdpOffer, err := decrypt(encryptedOffer, fixedSecret)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error decrypting auto offer:", err)
+				_ = s.Close()
+				return
+			}
+			config := webrtc.Configuration{
+				ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+			}
+			pc, err := webrtc.NewPeerConnection(config)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error creating PeerConnection (responder):", err)
+				_ = s.Close()
+				return
+			}
+			pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+				fmt.Printf("[WebRTC-Auto] Data channel from %s opened!\n", initiator)
+				dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+					fmt.Printf("[WebRTC-Auto] Message from %s: %s\n", initiator, string(msg.Data))
+				})
+				webrtcMu.Lock()
+				webrtcConnections[initiator] = dc
+				webrtcMu.Unlock()
+			})
+			offerDesc := webrtc.SessionDescription{
+				Type: webrtc.SDPTypeOffer,
+				SDP:  sdpOffer,
+			}
+			err = pc.SetRemoteDescription(offerDesc)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error setting remote description on responder:", err)
+				_ = s.Close()
+				return
+			}
+			answer, err := pc.CreateAnswer(nil)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error creating answer:", err)
+				_ = s.Close()
+				return
+			}
+			err = pc.SetLocalDescription(answer)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error setting local description on responder:", err)
+				_ = s.Close()
+				return
+			}
+			<-webrtc.GatheringCompletePromise(pc)
+			sdpAnswer := pc.LocalDescription().SDP
+			encryptedAnswer, err := encrypt(sdpAnswer, fixedSecret)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error encrypting answer:", err)
+				_ = s.Close()
+				return
+			}
+			// Send auto-answer back to the initiator.
+			response := fmt.Sprintf("wrtc-auto-answer:%s:%s\n", localPeerID, encryptedAnswer)
+			sendToPeer(h, initiator, response)
+			fmt.Printf("[WebRTC-Auto] Sent automatic answer to %s\n", initiator)
+			_ = s.Close()
+		// NEW: Automatic WebRTC handshake – Answer
+		case strings.HasPrefix(data, "wrtc-auto-answer:"):
+			parts := strings.SplitN(data, ":", 3)
+			if len(parts) < 3 {
+				fmt.Println("[WebRTC-Auto] Invalid auto answer message.")
+				_ = s.Close()
+				return
+			}
+			responder := parts[1]
+			encryptedAnswer := parts[2]
+			webrtcMu.Lock()
+			pending, ok := pendingWrtc[responder]
+			webrtcMu.Unlock()
+			if !ok {
+				fmt.Printf("[WebRTC-Auto] No pending auto offer for responder %s\n", responder)
+				_ = s.Close()
+				return
+			}
+			sdpAnswer, err := decrypt(encryptedAnswer, pending.secret)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error decrypting auto answer:", err)
+				_ = s.Close()
+				return
+			}
+			answerDesc := webrtc.SessionDescription{
+				Type: webrtc.SDPTypeAnswer,
+				SDP:  sdpAnswer,
+			}
+			err = pending.pc.SetRemoteDescription(answerDesc)
+			if err != nil {
+				fmt.Println("[WebRTC-Auto] Error setting remote description on initiator:", err)
+				_ = s.Close()
+				return
+			}
+			fmt.Printf("[WebRTC-Auto] WebRTC connection with %s established!\n", responder)
+			webrtcMu.Lock()
+			delete(pendingWrtc, responder)
+			webrtcMu.Unlock()
+			_ = s.Close()
 		default:
 			fmt.Printf("[⚠️] Unknown message type: %s\n", data)
 			_ = s.Close()
@@ -778,4 +922,59 @@ func webrtcFinalize(image string) {
 	}
 	fmt.Println("[WebRTC] WebRTC connection established!")
 	pendingOffer = nil
+}
+
+func webrtcAutoInitiate(h host.Host, target string) {
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+	}
+	pc, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		fmt.Println("[WebRTC-Auto] Error creating PeerConnection:", err)
+		return
+	}
+	dc, err := pc.CreateDataChannel("data", nil)
+	if err != nil {
+		fmt.Println("[WebRTC-Auto] Error creating DataChannel:", err)
+		return
+	}
+	dc.OnOpen(func() {
+		fmt.Printf("[WebRTC-Auto] Data channel to %s opened!\n", target)
+		webrtcMu.Lock()
+		webrtcConnections[target] = dc
+		webrtcMu.Unlock()
+	})
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		fmt.Printf("[WebRTC-Auto] Message from %s: %s\n", target, string(msg.Data))
+	})
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		fmt.Println("[WebRTC-Auto] Error creating offer:", err)
+		return
+	}
+	err = pc.SetLocalDescription(offer)
+	if err != nil {
+		fmt.Println("[WebRTC-Auto] Error setting local description:", err)
+		return
+	}
+	<-webrtc.GatheringCompletePromise(pc)
+	sdpOffer := pc.LocalDescription().SDP
+	encryptedOffer, err := encrypt(sdpOffer, fixedSecret)
+	if err != nil {
+		fmt.Println("[WebRTC-Auto] Error encrypting offer:", err)
+		return
+	}
+	webrtcMu.Lock()
+	pendingWrtc[target] = &webrtcOfferInfo{
+		sdp:       sdpOffer,
+		pc:        pc,
+		dc:        dc,
+		secret:    fixedSecret,
+		offerCode: encryptedOffer,
+	}
+	webrtcMu.Unlock()
+	// Send automatic webrtc offer over P2P
+	msg := fmt.Sprintf("wrtc-auto-offer:%s:%s\n", localPeerID, encryptedOffer)
+	sendToPeer(h, target, msg)
+	fmt.Printf("[WebRTC-Auto] Sent automatic offer to %s\n", target)
 }
