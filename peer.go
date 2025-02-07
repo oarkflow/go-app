@@ -26,17 +26,6 @@ const (
 	Rendezvous = "p2p-chat-file-rendezvous"
 )
 
-var (
-	username    = "Anonymous"
-	currentRoom = "public"
-	rooms       = map[string]bool{"public": true}
-	adminRooms  = map[string]bool{"public": false}
-
-	roomCodes = make(map[string]string)
-
-	localPeerID string
-)
-
 type fileShare struct {
 	filename string
 	filepath string
@@ -44,10 +33,13 @@ type fileShare struct {
 }
 
 var (
-	fileShares = make(map[string]fileShare)
-)
-
-var (
+	username        = "Anonymous"
+	currentRoom     = "public"
+	rooms           = map[string]bool{"public": true}
+	adminRooms      = map[string]bool{"public": false}
+	roomCodes       = make(map[string]string)
+	localPeerID     string
+	fileShares      = make(map[string]fileShare)
 	inputChan       = make(chan string)
 	fileRequestChan = make(chan fileRequest)
 	currentDir      = "./files"
@@ -80,25 +72,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer h.Close()
-
+	defer func() {
+		_ = h.Close()
+	}()
 	localPeerID = h.ID().ShortString()
 	fmt.Printf("[🔗] Peer ID: %s\n", localPeerID)
 	for _, addr := range h.Addrs() {
 		fmt.Printf("[🌐] Listening on: %s/p2p/%s\n", addr, h.ID())
 	}
-
-	os.MkdirAll(currentDir, os.ModePerm)
-
+	_ = os.MkdirAll(currentDir, os.ModePerm)
 	mdnsService := mdns.NewMdnsService(h, Rendezvous, &discoveryNotifee{h: h, ctx: ctx})
 	if err := mdnsService.Start(); err != nil {
 		log.Fatal(err)
 	}
-
 	h.SetStreamHandler(ProtocolID, handleStream(h))
-
 	go readInput()
-
 	for {
 		select {
 		case req := <-fileRequestChan:
@@ -130,9 +118,7 @@ func processCommand(line string, h host.Host) {
 		newName := strings.TrimSpace(strings.TrimPrefix(line, "/username "))
 		username = newName
 		fmt.Printf("Username changed to %s\n", username)
-
 	case strings.HasPrefix(line, "/room "):
-
 		room := strings.TrimSpace(strings.TrimPrefix(line, "/room "))
 		if _, ok := rooms[room]; ok {
 			currentRoom = room
@@ -140,9 +126,7 @@ func processCommand(line string, h host.Host) {
 		} else {
 			fmt.Printf("You are not a member of room %s. Use /joinroom <code> or /createroom.\n", room)
 		}
-
 	case strings.HasPrefix(line, "/createroom "):
-
 		room := strings.TrimSpace(strings.TrimPrefix(line, "/createroom "))
 		rooms[room] = true
 		adminRooms[room] = true
@@ -150,11 +134,8 @@ func processCommand(line string, h host.Host) {
 		code := generateCode(6)
 		roomCodes[code] = room
 		fmt.Printf("Room '%s' created. Unique room code: %s (share this code to invite others)\n", room, code)
-
-		sendBroadcast(h, fmt.Sprintf("roomcode:%s:%s:%s\n", code, room, username))
-
+		// sendBroadcast(h, fmt.Sprintf("roomcode:%s:%s:%s\n", code, room, username))
 	case strings.HasPrefix(line, "/joinroom "):
-
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/joinroom "))
 		room, ok := roomCodes[code]
 		if !ok {
@@ -165,9 +146,7 @@ func processCommand(line string, h host.Host) {
 			fmt.Printf("Joined room %s\n", room)
 			sendBroadcast(h, fmt.Sprintf("join:%s:%s\n", room, username))
 		}
-
 	case strings.HasPrefix(line, "/invite "):
-
 		parts := strings.Fields(line)
 		if len(parts) < 3 {
 			fmt.Println("Usage: /invite <roomName> <peerID>")
@@ -181,9 +160,7 @@ func processCommand(line string, h host.Host) {
 				fmt.Printf("Invite sent to %s for room %s\n", target, room)
 			}
 		}
-
 	case strings.HasPrefix(line, "/kick "):
-
 		parts := strings.Fields(line)
 		if len(parts) < 3 {
 			fmt.Println("Usage: /kick <roomName> <peerID>")
@@ -197,9 +174,7 @@ func processCommand(line string, h host.Host) {
 				fmt.Printf("Kick message sent for %s from room %s\n", target, room)
 			}
 		}
-
 	case strings.HasPrefix(line, "/msg "):
-
 		parts := strings.SplitN(line, " ", 3)
 		if len(parts) < 3 {
 			fmt.Println("Usage: /msg <peerID> <message>")
@@ -208,46 +183,33 @@ func processCommand(line string, h host.Host) {
 			msg := parts[2]
 			sendToPeer(h, target, fmt.Sprintf("private:%s:%s:%s\n", target, username, msg))
 		}
-
 	case strings.HasPrefix(line, "/chat "):
-
 		msg := strings.TrimSpace(strings.TrimPrefix(line, "/chat "))
 		if currentRoom == "public" {
 			sendBroadcast(h, fmt.Sprintf("chat:public:%s:%s\n", username, msg))
 		} else {
 			sendBroadcast(h, fmt.Sprintf("chat:group:%s:%s:%s\n", currentRoom, username, msg))
 		}
-
 	case strings.HasPrefix(line, "/sendfile "):
-
 		filename := strings.TrimSpace(strings.TrimPrefix(line, "/sendfile "))
 		sendFile(h, filename)
-
 	case strings.HasPrefix(line, "/sendfilecode "):
-
 		filepathArg := strings.TrimSpace(strings.TrimPrefix(line, "/sendfilecode "))
-		sendFileCode(h, filepathArg)
-
+		sendFileCode(filepathArg)
 	case strings.HasPrefix(line, "/getfile "):
-
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/getfile "))
 		sendBroadcast(h, fmt.Sprintf("getfile:%s:%s\n", code, localPeerID))
-
 	case strings.HasPrefix(line, "/setdir "):
-
 		dir := strings.TrimSpace(strings.TrimPrefix(line, "/setdir "))
 		mu.Lock()
 		currentDir = dir
 		mu.Unlock()
 		fmt.Printf("Save directory set to: %s\n", currentDir)
-
 	case line == "/peers":
 		listPeers(h)
-
 	case line == "/exit":
 		fmt.Println("Exiting...")
 		os.Exit(0)
-
 	default:
 		fmt.Println("Invalid command.")
 	}
@@ -256,8 +218,8 @@ func processCommand(line string, h host.Host) {
 func sendBroadcast(h host.Host, msg string) {
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
-			s.Write([]byte(msg))
-			s.Close()
+			_, _ = s.Write([]byte(msg))
+			_ = s.Close()
 		}
 	}
 }
@@ -266,8 +228,8 @@ func sendToPeer(h host.Host, target string, msg string) {
 	for _, p := range h.Peerstore().Peers() {
 		if p.ShortString() == target {
 			if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
-				s.Write([]byte(msg))
-				s.Close()
+				_, _ = s.Write([]byte(msg))
+				_ = s.Close()
 			}
 		}
 	}
@@ -293,18 +255,16 @@ func handleStream(h host.Host) func(network.Stream) {
 		data, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Println("[⚠️] Error reading stream:", err)
-			s.Close()
+			_ = s.Close()
 			return
 		}
 		data = strings.TrimSpace(data)
 		switch {
-
 		case strings.HasPrefix(data, "chat:"):
-
 			parts := strings.SplitN(data, ":", 5)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid chat message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			if parts[1] == "public" {
@@ -312,7 +272,7 @@ func handleStream(h host.Host) func(network.Stream) {
 			} else if parts[1] == "group" {
 				if len(parts) < 5 {
 					fmt.Println("[⚠️] Invalid group chat format.")
-					s.Close()
+					_ = s.Close()
 					return
 				}
 				roomName := parts[2]
@@ -320,66 +280,55 @@ func handleStream(h host.Host) func(network.Stream) {
 					fmt.Printf("[Group:%s] %s: %s\n", roomName, parts[3], parts[4])
 				}
 			}
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "private:"):
-
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid private message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fmt.Printf("[Private] %s: %s\n", parts[2], parts[3])
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "invite:"):
-
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid invite message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
 			inviter := parts[2]
 			fmt.Printf("[Invite] %s invited you to join room '%s'. To join, type: /joinroom <roomCode>\n", inviter, roomName)
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "roomcode:"):
-
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid roomcode message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
 			roomName := parts[2]
-
 			roomCodes[code] = roomName
 			fmt.Printf("[Room Code] Room '%s' is available with code: %s (created by %s)\n", roomName, code, parts[3])
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "join:"):
-
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid join message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
 			joiner := parts[2]
 			fmt.Printf("[Room %s] %s has joined.\n", roomName, joiner)
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "kick:"):
-
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid kick message format.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			roomName := parts[1]
@@ -393,65 +342,55 @@ func handleStream(h host.Host) func(network.Stream) {
 				}
 				fmt.Printf("You have been removed from room %s. Switched to public room.\n", roomName)
 			}
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "file:"):
-
 			parts := strings.SplitN(data, ":", 2)
 			if len(parts) < 2 {
 				fmt.Println("[⚠️] Invalid file request received.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fName := strings.TrimSpace(parts[1])
 			fileRequestChan <- fileRequest{stream: s, fileName: fName}
-
 		case strings.HasPrefix(data, "filecode:"):
-
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[⚠️] Invalid filecode message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
 			fName := parts[2]
 			sender := parts[3]
 			fmt.Printf("[File Share] File '%s' is available with code: %s from %s. Use /getfile %s to request it.\n", fName, code, sender, code)
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "getfile:"):
-
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[⚠️] Invalid getfile message.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			code := parts[1]
 			receiver := parts[2]
-
 			share, ok := fileShares[code]
 			if !ok {
 				fmt.Printf("[⚠️] No file share found for code %s\n", code)
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			if share.sender != localPeerID {
 
-				s.Close()
+				_ = s.Close()
 				return
 			}
-
 			sendFileForCode(h, receiver, share)
-			s.Close()
-
+			_ = s.Close()
 		case strings.HasPrefix(data, "instantfile:"):
-
 			parts := strings.SplitN(data, ":", 2)
 			if len(parts) < 2 {
 				fmt.Println("[⚠️] Invalid instant file header.")
-				s.Close()
+				_ = s.Close()
 				return
 			}
 			fName := strings.TrimSpace(parts[1])
@@ -459,17 +398,16 @@ func handleStream(h host.Host) func(network.Stream) {
 			file, err := os.Create(savePath)
 			if err != nil {
 				fmt.Printf("[⚠️] Error creating file: %v\n", err)
-				s.Close()
+				_ = s.Close()
 				return
 			}
-			io.Copy(file, s)
-			file.Close()
-			s.Close()
+			_, _ = io.Copy(file, s)
+			_ = file.Close()
+			_ = s.Close()
 			fmt.Printf("Instant file received: %s\n", savePath)
-
 		default:
 			fmt.Printf("[⚠️] Unknown message type: %s\n", data)
-			s.Close()
+			_ = s.Close()
 		}
 	}
 }
@@ -481,7 +419,7 @@ func processFileRequest(req fileRequest) {
 	answer = strings.TrimSpace(answer)
 	if strings.ToLower(answer) != "y" {
 		fmt.Println("❌ File transfer rejected.")
-		req.stream.Close()
+		_ = req.stream.Close()
 		return
 	}
 	fmt.Print("Enter save directory (or press Enter for default): ")
@@ -494,19 +432,19 @@ func processFileRequest(req fileRequest) {
 	file, err := os.Create(savePath)
 	if err != nil {
 		fmt.Printf("[⚠️] Error creating file: %v\n", err)
-		req.stream.Close()
+		_ = req.stream.Close()
 		return
 	}
 	fmt.Printf("[📂] Receiving file: %s\n", savePath)
 	_, err = io.Copy(file, req.stream)
 	if err != nil {
 		fmt.Printf("[⚠️] Error receiving file: %v\n", err)
-		file.Close()
-		req.stream.Close()
+		_ = file.Close()
+		_ = req.stream.Close()
 		return
 	}
-	file.Close()
-	req.stream.Close()
+	_ = file.Close()
+	_ = req.stream.Close()
 	fmt.Printf("[✅] File received: %s\n", savePath)
 }
 
@@ -516,38 +454,40 @@ func sendFile(h host.Host, filename string) {
 		fmt.Println("[⚠️] Error opening file.")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	baseName := filepath.Base(filename)
 	for _, p := range h.Peerstore().Peers() {
 		if s, err := h.NewStream(context.Background(), p, ProtocolID); err == nil {
 			fmt.Printf("Sending file: %s\n", baseName)
 
-			s.Write([]byte("file:" + baseName + "\n"))
-			io.Copy(s, file)
-			s.Close()
-			file.Seek(0, 0)
+			_, _ = s.Write([]byte("file:" + baseName + "\n"))
+			_, _ = io.Copy(s, file)
+			_ = s.Close()
+			_, _ = file.Seek(0, 0)
 		}
 	}
 }
 
-func sendFileCode(h host.Host, filepathArg string) {
+func sendFileCode(filepathArg string) {
 	file, err := os.Open(filepathArg)
 	if err != nil {
 		fmt.Println("[⚠️] Error opening file.")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	baseName := filepath.Base(filepathArg)
 	code := generateCode(6)
-
 	fileShares[code] = fileShare{
 		filename: baseName,
 		filepath: filepathArg,
 		sender:   localPeerID,
 	}
 	fmt.Printf("File sharing code for '%s': %s (share this code with recipients)\n", baseName, code)
-
-	sendBroadcast(h, fmt.Sprintf("filecode:%s:%s:%s\n", code, baseName, localPeerID))
+	// sendBroadcast(h, fmt.Sprintf("filecode:%s:%s:%s\n", code, baseName, localPeerID))
 }
 
 func sendFileForCode(h host.Host, target string, share fileShare) {
@@ -558,17 +498,18 @@ func sendFileForCode(h host.Host, target string, share fileShare) {
 				fmt.Printf("Error creating stream for file transfer: %v\n", err)
 				return
 			}
-
-			s.Write([]byte("instantfile:" + share.filename + "\n"))
+			_, _ = s.Write([]byte("instantfile:" + share.filename + "\n"))
 			f, err := os.Open(share.filepath)
 			if err != nil {
 				fmt.Printf("Error opening file for code transfer: %v\n", err)
-				s.Close()
+				_ = s.Close()
 				return
 			}
-			defer f.Close()
-			io.Copy(s, f)
-			s.Close()
+			defer func() {
+				_ = f.Close()
+			}()
+			_, _ = io.Copy(s, f)
+			_ = s.Close()
 			fmt.Printf("File '%s' sent to peer %s\n", share.filename, target)
 			return
 		}
