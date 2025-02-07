@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -24,10 +23,6 @@ import (
 
 	"github.com/pion/webrtc/v3"
 )
-
-// =====================
-// Existing libp2p code
-// =====================
 
 const (
 	ProtocolID = "/p2p-chat-file/1.0.0"
@@ -94,12 +89,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Set our stream handler (for normal chat, file messages and new SDP signaling messages)
 	h.SetStreamHandler(ProtocolID, handleStream(h))
-
 	go readInput()
-
-	// Main loop processes file requests and user commands.
 	for {
 		select {
 		case req := <-fileRequestChan:
@@ -222,12 +213,9 @@ func processCommand(line string, h host.Host) {
 	case line == "/exit":
 		fmt.Println("Exiting...")
 		os.Exit(0)
-	// ===== New WebRTC Commands =====
 	case line == "/webrtc-offer":
-		// Create a WebRTC offer (with a unique code) and broadcast the code.
 		initiateWebRTCOffer(h)
 	case strings.HasPrefix(line, "/webrtc-accept "):
-		// Accept a WebRTC offer using its unique code.
 		code := strings.TrimSpace(strings.TrimPrefix(line, "/webrtc-accept "))
 		acceptWebRTCOffer(code, h)
 	default:
@@ -279,9 +267,7 @@ func handleStream(h host.Host) func(network.Stream) {
 			return
 		}
 		data = strings.TrimSpace(data)
-		// ----------------------------
-		// Existing message types…
-		// ----------------------------
+
 		switch {
 		case strings.HasPrefix(data, "chat:"):
 			parts := strings.SplitN(data, ":", 5)
@@ -427,11 +413,7 @@ func handleStream(h host.Host) func(network.Stream) {
 			_ = file.Close()
 			_ = s.Close()
 			fmt.Printf("Instant file received: %s\n", savePath)
-		// ----------------------------
-		// New WebRTC signaling messages
-		// ----------------------------
 		case strings.HasPrefix(data, "sdp-offer-code:"):
-			// Format: sdp-offer-code:<offerCode>:<offererID>
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[WebRTC] Invalid sdp-offer-code message.")
@@ -440,12 +422,12 @@ func handleStream(h host.Host) func(network.Stream) {
 			}
 			offerCode := parts[1]
 			offererID := parts[2]
-			// Save for later lookup by an answerer.
+
 			pendingOfferCodes[offerCode] = offererID
 			fmt.Printf("[WebRTC] Received offer code %s from %s\n", offerCode, offererID)
 			_ = s.Close()
 		case strings.HasPrefix(data, "sdp-request:"):
-			// Format: sdp-request:<offerCode>:<requesterID>
+
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[WebRTC] Invalid sdp-request message.")
@@ -457,7 +439,6 @@ func handleStream(h host.Host) func(network.Stream) {
 			processSDPRequest(offerCode, requesterID, h)
 			_ = s.Close()
 		case strings.HasPrefix(data, "sdp-offer-full:"):
-			// Format: sdp-offer-full:<offerCode>:<base64Offer>
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[WebRTC] Invalid sdp-offer-full message.")
@@ -469,7 +450,6 @@ func handleStream(h host.Host) func(network.Stream) {
 			processSDPOfferFull(offerCode, encodedOffer, h)
 			_ = s.Close()
 		case strings.HasPrefix(data, "sdp-answer-code:"):
-			// Format: sdp-answer-code:<offerCode>:<answerCode>:<answererID>
 			parts := strings.SplitN(data, ":", 4)
 			if len(parts) < 4 {
 				fmt.Println("[WebRTC] Invalid sdp-answer-code message.")
@@ -482,7 +462,6 @@ func handleStream(h host.Host) func(network.Stream) {
 			processSDPAnswerCode(offerCode, answerCode, answererID, h)
 			_ = s.Close()
 		case strings.HasPrefix(data, "sdp-request-answer:"):
-			// Format: sdp-request-answer:<answerCode>:<requesterID>
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[WebRTC] Invalid sdp-request-answer message.")
@@ -494,7 +473,6 @@ func handleStream(h host.Host) func(network.Stream) {
 			processSDPRequestAnswer(answerCode, requesterID, h)
 			_ = s.Close()
 		case strings.HasPrefix(data, "sdp-answer-full:"):
-			// Format: sdp-answer-full:<answerCode>:<base64Answer>
 			parts := strings.SplitN(data, ":", 3)
 			if len(parts) < 3 {
 				fmt.Println("[WebRTC] Invalid sdp-answer-full message.")
@@ -586,8 +564,7 @@ func sendFileCode(filepathArg string) {
 		sender:   localPeerID,
 	}
 	fmt.Printf("File sharing code for '%s': %s (share this code with recipients)\n", baseName, code)
-	// Optionally broadcast the filecode message.
-	// sendBroadcast(h, fmt.Sprintf("filecode:%s:%s:%s\n", code, baseName, localPeerID))
+
 }
 
 func sendFileForCode(h host.Host, target string, share fileShare) {
@@ -626,11 +603,6 @@ func listPeers(h host.Host) {
 	}
 }
 
-// ==========================
-// New WebRTC Signaling Code
-// ==========================
-
-// Global maps to hold pending SDP offers/answers.
 var pendingOffers = make(map[string]*webrtcOfferInfo)
 
 type webrtcOfferInfo struct {
@@ -640,7 +612,7 @@ type webrtcOfferInfo struct {
 	fromPeer string
 }
 
-var pendingOfferCodes = make(map[string]string) // For answerers: offerCode -> offererID
+var pendingOfferCodes = make(map[string]string)
 
 var pendingAnswers = make(map[string]*webrtcAnswerInfo)
 
@@ -650,11 +622,7 @@ type webrtcAnswerInfo struct {
 	fromPeer string
 }
 
-// initiateWebRTCOffer creates a new WebRTC PeerConnection (as offerer),
-// creates a data channel, gathers the SDP offer, generates a unique code,
-// stores the offer, and broadcasts the code.
 func initiateWebRTCOffer(h host.Host) {
-	// Create a new PeerConnection with a public STUN server.
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -665,8 +633,6 @@ func initiateWebRTCOffer(h host.Host) {
 		fmt.Println("[WebRTC] Error creating PeerConnection:", err)
 		return
 	}
-
-	// Create a data channel.
 	dc, err := pc.CreateDataChannel("data", nil)
 	if err != nil {
 		fmt.Println("[WebRTC] Error creating data channel:", err)
@@ -678,26 +644,18 @@ func initiateWebRTCOffer(h host.Host) {
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		fmt.Printf("[WebRTC] Message on data channel: %s\n", string(msg.Data))
 	})
-
-	// Create an offer.
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		fmt.Println("[WebRTC] Error creating offer:", err)
 		return
 	}
-	// Set the local description.
 	err = pc.SetLocalDescription(offer)
 	if err != nil {
 		fmt.Println("[WebRTC] Error setting local description:", err)
 		return
 	}
-	// Wait for ICE gathering to complete.
 	<-webrtc.GatheringCompletePromise(pc)
-
-	// Use the finalized SDP.
 	sdpOffer := pc.LocalDescription().SDP
-
-	// Generate a unique code for this offer.
 	offerCode := generateCode(6)
 	pendingOffers[offerCode] = &webrtcOfferInfo{
 		sdp:      sdpOffer,
@@ -705,14 +663,10 @@ func initiateWebRTCOffer(h host.Host) {
 		dc:       dc,
 		fromPeer: localPeerID,
 	}
-
 	fmt.Printf("[WebRTC] Offer created with code: %s\n", offerCode)
-	// Broadcast the offer code (without the full SDP).
 	sendBroadcast(h, fmt.Sprintf("sdp-offer-code:%s:%s\n", offerCode, localPeerID))
 }
 
-// acceptWebRTCOffer is invoked when the user types "/webrtc-accept <code>".
-// It looks up the offer code (received earlier via a broadcast) and sends a request.
 func acceptWebRTCOffer(offerCode string, h host.Host) {
 	offererID, ok := pendingOfferCodes[offerCode]
 	if !ok {
@@ -720,26 +674,21 @@ func acceptWebRTCOffer(offerCode string, h host.Host) {
 		return
 	}
 	fmt.Printf("[WebRTC] Requesting full offer SDP for code %s from %s\n", offerCode, offererID)
-	// Send a direct request for the full offer SDP.
 	sendToPeer(h, offererID, fmt.Sprintf("sdp-request:%s:%s\n", offerCode, localPeerID))
-	// (The response will be processed asynchronously in handleStream.)
 }
 
-// processSDPRequest is called on the offerer side when someone requests the full offer SDP.
 func processSDPRequest(offerCode, requesterID string, h host.Host) {
 	offerInfo, ok := pendingOffers[offerCode]
 	if !ok {
 		fmt.Printf("[WebRTC] No pending offer for code %s\n", offerCode)
 		return
 	}
-	// Base64-encode the offer SDP so that newlines are not lost.
 	encoded := base64.StdEncoding.EncodeToString([]byte(offerInfo.sdp))
 	msg := fmt.Sprintf("sdp-offer-full:%s:%s\n", offerCode, encoded)
 	sendToPeer(h, requesterID, msg)
 	fmt.Printf("[WebRTC] Sent full offer SDP for code %s to %s\n", offerCode, requesterID)
 }
 
-// processSDPOfferFull is invoked on the answerer side when the full offer SDP is received.
 func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 	decoded, err := base64.StdEncoding.DecodeString(encodedOffer)
 	if err != nil {
@@ -748,8 +697,6 @@ func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 	}
 	sdpOffer := string(decoded)
 	fmt.Printf("[WebRTC] Received full offer SDP for code %s\n", offerCode)
-
-	// Create a new PeerConnection as the answerer.
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -760,16 +707,12 @@ func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 		fmt.Println("[WebRTC] Error creating PeerConnection (answerer):", err)
 		return
 	}
-
-	// When a data channel is created by the offerer, capture it.
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		fmt.Printf("[WebRTC] Data channel '%s'-%d opened on answerer side.\n", dc.Label(), dc.ID())
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			fmt.Printf("[WebRTC] Message on data channel (answerer): %s\n", string(msg.Data))
 		})
 	})
-
-	// Set remote description from the offer.
 	offerDesc := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
 		SDP:  sdpOffer,
@@ -779,8 +722,6 @@ func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 		fmt.Println("[WebRTC] Error setting remote description on answerer:", err)
 		return
 	}
-
-	// Create an answer.
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		fmt.Println("[WebRTC] Error creating answer:", err)
@@ -793,29 +734,22 @@ func processSDPOfferFull(offerCode, encodedOffer string, h host.Host) {
 	}
 	<-webrtc.GatheringCompletePromise(pc)
 	sdpAnswer := pc.LocalDescription().SDP
-
-	// Generate a unique code for the answer.
 	answerCode := generateCode(6)
 	pendingAnswers[answerCode] = &webrtcAnswerInfo{
 		sdp:      sdpAnswer,
 		pc:       pc,
 		fromPeer: localPeerID,
 	}
-	// Retrieve the offerer ID from our stored mapping.
 	offererID := pendingOfferCodes[offerCode]
 	fmt.Printf("[WebRTC] Answer created with code %s. Sending answer code to offerer %s\n", answerCode, offererID)
-	// Send the answer code along with the original offer code.
 	sendToPeer(h, offererID, fmt.Sprintf("sdp-answer-code:%s:%s:%s\n", offerCode, answerCode, localPeerID))
 }
 
-// processSDPAnswerCode is invoked on the offerer side when an answerer notifies an answer code.
 func processSDPAnswerCode(offerCode, answerCode, answererID string, h host.Host) {
 	fmt.Printf("[WebRTC] Received answer code %s for offer %s from %s\n", answerCode, offerCode, answererID)
-	// Now ask the answerer for the full answer SDP.
 	sendToPeer(h, answererID, fmt.Sprintf("sdp-request-answer:%s:%s\n", answerCode, localPeerID))
 }
 
-// processSDPRequestAnswer is invoked on the answerer side when the offerer requests the full answer SDP.
 func processSDPRequestAnswer(answerCode, requesterID string, h host.Host) {
 	answerInfo, ok := pendingAnswers[answerCode]
 	if !ok {
@@ -828,7 +762,6 @@ func processSDPRequestAnswer(answerCode, requesterID string, h host.Host) {
 	fmt.Printf("[WebRTC] Sent full answer SDP for code %s to %s\n", answerCode, requesterID)
 }
 
-// processSDPAnswerFull is invoked on the offerer side when the full answer SDP is received.
 func processSDPAnswerFull(answerCode, encodedAnswer string) {
 	decoded, err := base64.StdEncoding.DecodeString(encodedAnswer)
 	if err != nil {
@@ -837,12 +770,7 @@ func processSDPAnswerFull(answerCode, encodedAnswer string) {
 	}
 	sdpAnswer := string(decoded)
 	fmt.Printf("[WebRTC] Received full answer SDP for answer code %s\n", answerCode)
-	// Here we need to match the answer with the corresponding offer.
-	// For simplicity we loop over pendingOffers to find the one that is waiting.
 	for oc, info := range pendingOffers {
-		// (In a more complete implementation, you would store the answer code together with the offer.)
-		// Here we assume that the offerer that gets an answer always matches the pending offer.
-		// Set the remote description on the offerer’s PeerConnection.
 		answerDesc := webrtc.SessionDescription{
 			Type: webrtc.SDPTypeAnswer,
 			SDP:  sdpAnswer,
@@ -855,9 +783,4 @@ func processSDPAnswerFull(answerCode, encodedAnswer string) {
 		fmt.Printf("[WebRTC] WebRTC connection established for offer %s!\n", oc)
 		break
 	}
-
 }
-
-//
-// End of code
-//
