@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Go API Client - Postman Alternative</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <!-- Header: Workspace & Env Variables -->
+  <header class="bg-white shadow p-4 flex flex-col md:flex-row items-center justify-between">
+    <h1 class="text-2xl font-bold">Go API Client</h1>
+    <div class="flex flex-wrap items-center space-x-4 mt-2 md:mt-0">
+      <!-- Workspace Controls -->
+      <select id="workspaceSelect" class="border rounded p-2"></select>
+      <input id="newWorkspaceName" type="text" placeholder="New workspace" class="border rounded p-2" />
+      <button id="createWorkspaceBtn" class="bg-green-500 text-white px-3 py-2 rounded">Create</button>
+      <!-- Env Variable Controls -->
+      <div class="flex items-center space-x-2">
+        <input id="envKey" type="text" placeholder="Key" class="border rounded p-2" />
+        <input id="envValue" type="text" placeholder="Value" class="border rounded p-2" />
+        <button id="setEnvBtn" class="bg-blue-500 text-white px-3 py-2 rounded">Set Env</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="p-4">
+    <!-- Env Vars Display -->
+    <section class="bg-white shadow rounded p-4 mb-4">
+      <h2 class="text-xl font-semibold mb-2">Environment Variables</h2>
+      <div id="envVarsDisplay" class="flex flex-wrap gap-2"></div>
+    </section>
+
+    <!-- Request Tabs -->
+    <section class="bg-white shadow rounded">
+      <div id="tabsBar" class="flex border-b">
+        <!-- Dynamic tab headers -->
+        <button id="addTabBtn" class="px-4 py-2 text-green-500 hover:text-green-600">+ Add Request</button>
+      </div>
+      <div id="tabsContent" class="p-4">
+        <!-- Dynamic request panels -->
+      </div>
+    </section>
+
+    <!-- Response Section with Tabs -->
+    <section class="mt-6">
+      <h2 class="text-2xl font-semibold mb-2">Response</h2>
+      <div id="responseTabs" class="mb-4 flex border-b">
+        <button id="responseBodyTab" class="px-4 py-2 active-tab">Response Body</button>
+        <button id="responseHeaderTab" class="px-4 py-2">Response Header</button>
+      </div>
+      <div id="responseContent">
+        <!-- Response Body Section -->
+        <div id="responseBodySection">
+          <div class="toggle-buttons mb-2">
+            <button id="parseResponseBtn" class="px-3 py-1 border mr-2">Parse Response</button>
+            <button id="rawResponseBtn" class="px-3 py-1 border">Raw Response</button>
+          </div>
+          <pre id="responseBody" class="bg-gray-800 text-green-300 p-4 rounded overflow-auto"></pre>
+        </div>
+        <!-- Response Header Section -->
+        <div id="responseHeaderSection" class="hidden">
+          <pre id="responseHeader" class="bg-gray-800 text-green-300 p-4 rounded overflow-auto"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>
