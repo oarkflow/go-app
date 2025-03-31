@@ -1,0 +1,11 @@
+[
+    {
+        "id": "render",
+        "root": "./static/dist",
+        "prefix": "/renderer",
+        "use_index": true,
+        "compress": true,
+        "index": "index",
+        "extension": ".html"
+    }
+]

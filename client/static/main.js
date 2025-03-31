@@ -167,8 +167,8 @@ document.addEventListener("DOMContentLoaded", () => {
     return `
       <!-- Top Bar: URL and HTTP Method -->
       <div class="flex items-center space-x-2 mb-4">
-        <input type="url" class="url flex-grow border rounded p-2" placeholder="https://api.example.com/data" required>
-        <select class="method border rounded p-1 text-sm">
+        <input type="url" class="url flex-grow border rounded p-2 compact-input" placeholder="https://api.example.com/data" required>
+        <select class="method border rounded p-1 compact-input">
           <option value="GET">GET</option>
           <option value="POST">POST</option>
           <option value="PUT">PUT</option>
@@ -178,15 +178,15 @@ document.addEventListener("DOMContentLoaded", () => {
       </div>
       <!-- Sub-Tabs: Request and Headers -->
       <div class="sub-tabs border-b mb-4">
-        <button class="subTabBtn active-subTab px-3 py-1" data-target="req-${tabId}">Request</button>
-        <button class="subTabBtn px-3 py-1" data-target="hdr-${tabId}">Headers</button>
+        <button class="subTabBtn active-subTab px-3 py-1 compact-input" data-target="req-${tabId}">Request</button>
+        <button class="subTabBtn px-3 py-1 compact-input" data-target="hdr-${tabId}">Headers</button>
       </div>
       <!-- Request Panel -->
       <div id="req-${tabId}" class="subTabContent">
         <!-- Body Type Selector -->
         <div class="mb-4">
           <label class="mr-2">Body Type:</label>
-          <select class="bodyTypeSelector border rounded p-1 text-sm">
+          <select class="bodyTypeSelector border rounded p-1 compact-input">
             <option value="raw">Raw</option>
             <option value="keyvalue">Key-Value</option>
             <option value="file">File Upload</option>
@@ -195,7 +195,7 @@ document.addEventListener("DOMContentLoaded", () => {
         <!-- Content-Type (dropdown) -->
         <div class="mb-4">
           <label class="mr-2">Content-Type:</label>
-          <select class="bodyContentType border rounded p-1 text-sm">
+          <select class="bodyContentType border rounded p-1 compact-input">
             <option value="application/json">application/json</option>
             <option value="text/plain">text/plain</option>
             <option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option>
@@ -204,7 +204,7 @@ document.addEventListener("DOMContentLoaded", () => {
         </div>
         <!-- Raw Body -->
         <div class="bodyRaw mb-4">
-          <textarea class="rawBody w-full border rounded p-2 h-24" placeholder='{"key":"value"}'></textarea>
+          <textarea class="rawBody w-full border rounded p-2 compact-input" placeholder='{"key":"value"}'></textarea>
         </div>
         <!-- Key-Value Body -->
         <div class="bodyKeyValue hidden mb-4">
@@ -213,22 +213,22 @@ document.addEventListener("DOMContentLoaded", () => {
         </div>
         <!-- File Upload -->
         <div class="bodyFile hidden mb-4">
-          <input type="file" class="fileInput border rounded p-2 w-full" />
+          <input type="file" class="fileInput border rounded p-2 w-full compact-input" />
         </div>
       </div>
       <!-- Headers Panel -->
       <div id="hdr-${tabId}" class="subTabContent hidden">
-        <!-- Header Type Selector -->
+        <!-- Header Input Type Selector -->
         <div class="mb-4">
-          <label class="mr-2">Header Input Type:</label>
-          <select class="headerInputType border rounded p-1 text-sm">
+          <label class="mr-2">Header Type:</label>
+          <select class="headerInputType border rounded p-1 compact-input">
             <option value="json">JSON</option>
             <option value="keyvalue">Key-Value</option>
           </select>
         </div>
         <!-- JSON Headers -->
         <div class="headersJson mb-4">
-          <textarea class="headers w-full border rounded p-2 h-20" placeholder='e.g., {"Authorization": "Bearer token"}'></textarea>
+          <textarea class="headers w-full border rounded p-2 compact-input" placeholder='{"Authorization": "Bearer token"}'></textarea>
         </div>
         <!-- Key-Value Headers -->
         <div class="headersKVP hidden mb-4">
@@ -238,7 +238,7 @@ document.addEventListener("DOMContentLoaded", () => {
       </div>
       <!-- Send Request Button -->
       <div>
-        <button class="sendRequestBtn bg-blue-500 text-white px-4 py-2 rounded">Send Request</button>
+        <button class="sendRequestBtn bg-blue-500 text-white px-4 py-2 rounded compact-input">Send Request</button>
       </div>
     `;
   }
@@ -250,15 +250,15 @@ document.addEventListener("DOMContentLoaded", () => {
     const keyInput = document.createElement("input");
     keyInput.type = "text";
     keyInput.placeholder = "Key";
-    keyInput.className = "kvKey border p-1 text-sm";
+    keyInput.className = "kvKey border p-1 compact-input";
     const valueInput = document.createElement("input");
     valueInput.type = "text";
     valueInput.placeholder = "Value";
-    valueInput.className = "kvValue border p-1 text-sm";
+    valueInput.className = "kvValue border p-1 compact-input";
     const removeBtn = document.createElement("button");
     removeBtn.type = "button";
     removeBtn.textContent = "✕";
-    removeBtn.className = "removeKvBtn text-red-500 text-sm";
+    removeBtn.className = "removeKvBtn text-red-500 compact-input";
     removeBtn.addEventListener("click", () => row.remove());
     row.append(keyInput, valueInput, removeBtn);
     container.appendChild(row);
@@ -272,9 +272,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const target = btn.dataset.target;
         panel.querySelectorAll(".subTabBtn").forEach(b => b.classList.remove("active-subTab", "bg-gray-200"));
         btn.classList.add("active-subTab", "bg-gray-200");
-        panel.querySelectorAll(".subTabContent").forEach(content => {
-          content.classList.add("hidden");
-        });
+        panel.querySelectorAll(".subTabContent").forEach(content => content.classList.add("hidden"));
         panel.querySelector("#" + target).classList.remove("hidden");
       });
     });
@@ -302,7 +300,7 @@ document.addEventListener("DOMContentLoaded", () => {
       headersKVP.classList.toggle("hidden", type !== "keyvalue");
     });
 
-    // Add key-value rows
+    // Add key-value rows for body and headers.
     const addBodyKVPBtn = panel.querySelector(".addBodyKVPBtn");
     const bodyKVPContainer = panel.querySelector(".bodyKVPContainer");
     addBodyKVPBtn.addEventListener("click", () => addKVRow(bodyKVPContainer));
@@ -318,7 +316,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const url = panel.querySelector(".url").value;
     let headers = {};
 
-    // Get header input based on type
+    // Determine header input type.
     const headerType = panel.querySelector(".headerInputType").value;
     if (headerType === "json") {
       try {
@@ -338,7 +336,7 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     }
 
-    // Prepare payload based on body type
+    // Build payload based on the chosen body type.
     const bodyType = panel.querySelector(".bodyTypeSelector").value;
     let payload = {
       method,
@@ -407,7 +405,6 @@ document.addEventListener("DOMContentLoaded", () => {
   function displayResponse(response) {
     latestRawResponse = response.body || "";
     responseBodyPre.textContent = latestRawResponse;
-
     const formattedHeaders = Object.entries(response.headers || {}).map(([key, value]) => {
       const formattedValue = Array.isArray(value) ? value.join(",") : value;
       return `${key}: ${formattedValue}`;
