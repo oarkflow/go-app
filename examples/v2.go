@@ -22,6 +22,10 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+type contextKey string
+
+const startTimeKey contextKey = "startTime"
+
 type Config struct {
 	MailboxSize         int           `yaml:"mailbox_size"`
 	MaxRestarts         int           `yaml:"max_restarts"`
@@ -274,6 +278,10 @@ func enqueueDeadLetter(msg Message) {
 }
 
 func structuredLog(component, msg string, fields map[string]any) {
+	if fields == nil {
+		fields = make(map[string]any)
+	}
+	fields["timestamp"] = time.Now().Format(time.RFC3339)
 	entry, _ := json.Marshal(fields)
 	log.Printf("[%s] %s - %s", component, msg, string(entry))
 }
@@ -593,7 +601,7 @@ type ActorSystem struct {
 func NewActorSystem(cfg *Config) *ActorSystem {
 	ctx, cancel := context.WithCancel(context.Background())
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
-	startTimeCtx := context.WithValue(ctx, "startTime", time.Now())
+	startTimeCtx := context.WithValue(ctx, startTimeKey, time.Now())
 	return &ActorSystem{
 		ctx:        startTimeCtx,
 		cancel:     cancel,
@@ -667,9 +675,10 @@ func (sys *ActorSystem) Shutdown() {
 
 func (sys *ActorSystem) ServeHealthCheck(addr string) {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		startTime, _ := sys.ctx.Value(startTimeKey).(time.Time)
 		status := map[string]any{
 			"active_actors": sys.activeActors.Load(),
-			"uptime":        time.Since(sys.ctx.Value("startTime").(time.Time)).String(),
+			"uptime":        time.Since(startTime).String(),
 		}
 		data, _ := json.Marshal(status)
 		w.Header().Set("Content-Type", "application/json")
@@ -871,7 +880,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	ctx := context.WithValue(context.Background(), "startTime", startedAt)
+	ctx := context.WithValue(context.Background(), startTimeKey, startedAt)
 	startDeadLetterProcessor()
 	system := NewActorSystem(cfg)
 	system.ctx = ctx
@@ -906,11 +915,15 @@ func main() {
 		if err := c.BodyParser(&payload); err != nil {
 			return c.Status(fiber.StatusBadRequest).SendString(err.Error())
 		}
+		data, ok := payload["data"].(string)
+		if !ok || data == "" {
+			return c.Status(fiber.StatusBadRequest).SendString("Invalid or missing 'data' field")
+		}
 		reqID := fmt.Sprintf("%d", time.Now().UnixNano())
 		replyChan := make(chan ResponseMessage, 1)
 		reqMsg := RequestMessage{
 			ID:      reqID,
-			Payload: payload["data"].(string),
+			Payload: data,
 			Reply:   replyChan,
 		}
 		if err := reqHandlerRef.Tell(reqMsg); err != nil {
@@ -933,11 +946,10 @@ func main() {
 		return c.JSON(map[string]any{"messages": iterations, "duration_ms": duration.Milliseconds()})
 	})
 	app.Get("/metrics", func(c *fiber.Ctx) error {
-		metricsData := map[string]any{
+		return c.JSON(map[string]any{
 			"active_actors": system.activeActors.Load(),
-			"start_time":    system.ctx.Value("startTime"),
-		}
-		return c.JSON(metricsData)
+			"start_time":    system.ctx.Value(startTimeKey),
+		})
 	})
 	go func() {
 		if err := app.Listen(cfg.HTTPPort); err != nil {
