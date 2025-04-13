@@ -59,6 +59,14 @@ type Config struct {
 	HTTPPort            string        `yaml:"http_port"`
 }
 
+func (cfg *Config) Validate() error {
+	if cfg.HTTPPort == "" {
+		return errors.New("HTTPPort must not be empty")
+	}
+	// ...additional validations as needed...
+	return nil
+}
+
 func LoadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -88,6 +96,9 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if cfg.HTTPPort == "" {
 		cfg.HTTPPort = ":3000"
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
 }
@@ -278,6 +289,15 @@ func RateLimitingInterceptor(maxPerSec int) MessageInterceptor {
 	}
 }
 
+func MetricsInterceptor(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
+	return func(ctx ActorContext, msg Message) {
+		startTime := time.Now()
+		next(ctx, msg)
+		duration := time.Since(startTime)
+		metrics.Observe("actor.message.processing.duration_ms", float64(duration.Milliseconds()))
+	}
+}
+
 var (
 	deadLetterQueue = make(chan Message, 10000)
 	deadLetterWg    sync.WaitGroup
@@ -371,12 +391,15 @@ func NewStandardMailbox(capacity int) *StandardMailbox {
 }
 
 func (m *StandardMailbox) Enqueue(message Message) error {
-	for i := 0; i < 3; i++ {
+	maxRetries := 3
+	delay := 50 * time.Millisecond
+	for i := 0; i < maxRetries; i++ {
 		select {
 		case m.ch <- message:
 			return nil
 		default:
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(delay)
+			delay *= 2
 		}
 	}
 	return errors.New("mailbox full after retries")
@@ -617,13 +640,16 @@ type JSONRemoteTransport struct {
 	breakerTimeout time.Duration
 }
 
+// Modified JSONRemoteTransport.SendRemote with enhanced logging and circuit breaker reset.
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
+			structuredLog("remote", "Circuit breaker open, skipping remote call", map[string]any{"actor": actorID})
 			return fmt.Errorf("circuit breaker open: skipping remote call")
 		} else {
 			t.circuitOpen = false
 			t.failureCount = 0
+			structuredLog("remote", "Circuit breaker reset", map[string]any{"actor": actorID})
 		}
 	}
 	data, err := json.Marshal(msg)
@@ -633,6 +659,7 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	maxRetries := 3
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		structuredLog("remote", "Attempting remote call", map[string]any{"actor": actorID, "attempt": attempt + 1})
 		resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
 		if err != nil {
 			lastErr = err
@@ -657,6 +684,7 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 		t.circuitOpen = true
 		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID, "failureCount": t.failureCount})
 	}
+	structuredLog("remote", "Failed remote message after retries", map[string]any{"actor": actorID, "maxRetries": maxRetries, "lastError": lastErr.Error()})
 	return fmt.Errorf("failed to send remote message after %d attempts: %w", maxRetries, lastErr)
 }
 
@@ -747,7 +775,8 @@ func (sys *ActorSystem) Shutdown() {
 }
 
 func (sys *ActorSystem) ServeHealthCheck(addr string) {
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		startTime, _ := sys.ctx.Value(startTimeKey).(time.Time)
 		status := map[string]any{
 			"active_actors": sys.activeActors.Load(),
@@ -758,7 +787,7 @@ func (sys *ActorSystem) ServeHealthCheck(addr string) {
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
 	})
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricsData := map[string]any{
 			"active_actors": sys.activeActors.Load(),
 			"start_time":    sys.ctx.Value(startTimeKey),
@@ -770,7 +799,7 @@ func (sys *ActorSystem) ServeHealthCheck(addr string) {
 	})
 	go func() {
 		structuredLog("health", "Starting health endpoint", map[string]any{"address": addr})
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := http.ListenAndServe(addr, mux); err != nil {
 			structuredLog("health", "Endpoint error", map[string]any{"error": err.Error()})
 		}
 	}()
@@ -979,6 +1008,7 @@ func main() {
 	interceptors := []MessageInterceptor{
 		LoggingInterceptor,
 		RateLimitingInterceptor(cfg.RateLimitPerSecond),
+		MetricsInterceptor,
 	}
 
 	app := fiber.New(fiber.Config{
@@ -991,6 +1021,13 @@ func main() {
 		},
 	})
 
+	// Add middleware to extract correlation id from the header.
+	app.Use(func(c *fiber.Ctx) error {
+		if corrID := c.Get("X-Correlation-ID"); corrID != "" {
+			c.Locals("correlation_id", corrID)
+		}
+		return c.Next()
+	})
 	app.Use(recoverMw.New())
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
@@ -1057,8 +1094,8 @@ func main() {
 		})
 	})
 
-	shutdownChan := make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	go func() {
 		if err := app.Listen(cfg.HTTPPort); err != nil {
 			logger.Fatal("Fiber server error", zap.Error(err))
@@ -1081,8 +1118,6 @@ func main() {
 	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
-	sig := <-shutdownChan
-	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": sig})
 
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -1092,11 +1127,12 @@ func main() {
 		"Sys":        m.Sys,
 		"NumGC":      m.NumGC,
 	})
-
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
-
-	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+	<-shutdownCtx.Done()
+	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": "context cancellation"})
+	// Trigger a graceful shutdown for Fiber and the actor system.
+	shutdownCtxTimeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := app.ShutdownWithContext(shutdownCtxTimeout); err != nil {
 		structuredLog("shutdown", "Fiber shutdown error", map[string]any{"error": err.Error()})
 	}
 	system.Shutdown()
