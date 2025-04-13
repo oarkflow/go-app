@@ -57,6 +57,7 @@ type Config struct {
 	HealthCheckEndpoint string        `yaml:"health_check_endpoint"`
 	RemoteEndpoint      string        `yaml:"remote_endpoint"`
 	HTTPPort            string        `yaml:"http_port"`
+	AdminToken          string        `yaml:"admin_token"` // new field for admin authentication
 }
 
 func (cfg *Config) Validate() error {
@@ -101,6 +102,23 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// Added dynamic configuration reloading using a background watcher.
+func watchConfig(filename string, currentCfg **Config, reloadInterval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(reloadInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			newCfg, err := LoadConfig(filename)
+			if err != nil {
+				structuredLog("config", "Config reload failed", map[string]any{"error": err.Error()})
+				continue
+			}
+			*currentCfg = newCfg
+			structuredLog("config", "Config reloaded", map[string]any{"file": filename})
+		}
+	}()
 }
 
 type Message any
@@ -1036,6 +1054,8 @@ func main() {
 	if err != nil {
 		logger.Fatal("Failed to load config", zap.Error(err))
 	}
+	// Start config reloading every 30 seconds.
+	watchConfig(*configPath, &cfg, 30*time.Second)
 	ctx := context.WithValue(context.Background(), startTimeKey, startedAt)
 	startDeadLetterProcessor()
 	system := NewActorSystem(cfg)
@@ -1065,6 +1085,48 @@ func main() {
 		return c.Next()
 	})
 	app.Use(recoverMw.New())
+
+	// Added admin authentication middleware.
+	adminMiddleware := func(c *fiber.Ctx) error {
+		token := c.Get("X-Admin-Token")
+		if token == "" || token != cfg.AdminToken {
+			return c.Status(fiber.StatusUnauthorized).JSON(map[string]any{"error": "Unauthorized"})
+		}
+		return c.Next()
+	}
+
+	// Apply admin middleware to the /admin route group.
+	admin := app.Group("/admin", adminMiddleware)
+
+	// --- Admin UI and API endpoints ---
+	admin.Get("/ui", func(c *fiber.Ctx) error {
+		// Serve the static HTML file for the admin UI.
+		return c.Type("html").SendFile("/Users/sujit/Sites/go-app/admin.html")
+	})
+
+	// API: List actors
+	admin.Get("/api/actors", func(c *fiber.Ctx) error {
+		actors := system.ListActors()
+		return c.JSON(actors)
+	})
+	admin.Get("/api/actors/:id/events", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		events, err := eventLogger.GetEvents(actorID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"actor": actorID, "events": events})
+	})
+	// API: Stop an actor by its id
+	admin.Post("/api/actors/:id/stop", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		if err := system.Stop(actorID); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"message": "Actor " + actorID + " stopped"})
+	})
+	// Optionally more actor operations (restart, etc.) can be added here.
+
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
@@ -1129,35 +1191,6 @@ func main() {
 			"start_time":    system.ctx.Value(startTimeKey),
 		})
 	})
-
-	// New routes for admin UI and API for actor monitoring and management.
-	app.Get("/admin/ui", func(c *fiber.Ctx) error {
-		// Serve the static HTML file for the admin UI.
-		return c.Type("html").SendFile("/Users/sujit/Sites/go-app/admin.html")
-	})
-
-	// API: List actors
-	app.Get("/admin/api/actors", func(c *fiber.Ctx) error {
-		actors := system.ListActors()
-		return c.JSON(actors)
-	})
-	app.Get("/admin/api/actors/:id/events", func(c *fiber.Ctx) error {
-		actorID := c.Params("id")
-		events, err := eventLogger.GetEvents(actorID)
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
-		}
-		return c.JSON(map[string]any{"actor": actorID, "events": events})
-	})
-	// API: Stop an actor by its id
-	app.Post("/admin/api/actors/:id/stop", func(c *fiber.Ctx) error {
-		actorID := c.Params("id")
-		if err := system.Stop(actorID); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
-		}
-		return c.JSON(map[string]any{"message": "Actor " + actorID + " stopped"})
-	})
-	// Optionally more actor operations (restart, etc.) can be added here.
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
