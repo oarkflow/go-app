@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 )
@@ -25,6 +26,16 @@ import (
 type contextKey string
 
 const startTimeKey contextKey = "startTime"
+
+var logger *zap.Logger
+
+func initLogger() {
+	var err error
+	logger, err = zap.NewProduction()
+	if err != nil {
+		log.Fatalf("Failed to initialize Zap logger: %v", err)
+	}
+}
 
 type Config struct {
 	MailboxSize         int           `yaml:"mailbox_size"`
@@ -273,13 +284,16 @@ func enqueueDeadLetter(msg Message) {
 	select {
 	case deadLetterQueue <- msg:
 	default:
-		// In worst-case, drop silently if DLQ is full.
 	}
 }
 
 func structuredLog(component, msg string, fields map[string]any) {
+	if logger != nil {
+		logger.Info(msg, zap.String("component", component), zap.Any("fields", fields))
+		return
+	}
 	if fields == nil {
-		fields = make(map[string]any)
+		fields = map[string]any{}
 	}
 	fields["timestamp"] = time.Now().Format(time.RFC3339)
 	entry, _ := json.Marshal(fields)
@@ -576,16 +590,25 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if err != nil {
 		return fmt.Errorf("serialization error: %w", err)
 	}
-	structuredLog("remote", "Sending remote message", map[string]any{"actor": actorID, "data": string(data)})
-	resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("HTTP POST error: %w", err)
+	maxRetries := 3
+	var attempt int
+	var lastErr error
+	for attempt = 0; attempt < maxRetries; attempt++ {
+		resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		} else {
+			lastErr = fmt.Errorf("remote endpoint returned status: %s", resp.Status)
+			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("remote endpoint returned status: %s", resp.Status)
-	}
-	return nil
+	return fmt.Errorf("failed to send remote message after %d attempts: %w", maxRetries, lastErr)
 }
 
 type ActorSystem struct {
@@ -603,14 +626,11 @@ func NewActorSystem(cfg *Config) *ActorSystem {
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
 	startTimeCtx := context.WithValue(ctx, startTimeKey, time.Now())
 	return &ActorSystem{
-		ctx:        startTimeCtx,
-		cancel:     cancel,
-		supervisor: supervisor,
-		remoteTransport: &JSONRemoteTransport{
-			endpoint: cfg.RemoteEndpoint,
-			client:   &http.Client{Timeout: 10 * time.Second},
-		},
-		config: cfg,
+		ctx:             startTimeCtx,
+		cancel:          cancel,
+		supervisor:      supervisor,
+		remoteTransport: &JSONRemoteTransport{endpoint: cfg.RemoteEndpoint, client: &http.Client{Timeout: 10 * time.Second}},
+		config:          cfg,
 	}
 }
 
@@ -681,6 +701,16 @@ func (sys *ActorSystem) ServeHealthCheck(addr string) {
 			"uptime":        time.Since(startTime).String(),
 		}
 		data, _ := json.Marshal(status)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	})
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metricsData := map[string]any{
+			"active_actors": sys.activeActors.Load(),
+			"start_time":    sys.ctx.Value(startTimeKey),
+		}
+		data, _ := json.Marshal(metricsData)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
@@ -875,10 +905,11 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 }
 
 func main() {
+	initLogger()
 	startedAt := time.Now()
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatal("Failed to load config", zap.Error(err))
 	}
 	ctx := context.WithValue(context.Background(), startTimeKey, startedAt)
 	startDeadLetterProcessor()
@@ -951,9 +982,12 @@ func main() {
 			"start_time":    system.ctx.Value(startTimeKey),
 		})
 	})
+	// Graceful shutdown of Fiber server and Actor system on SIGTERM or SIGINT.
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		if err := app.Listen(cfg.HTTPPort); err != nil {
-			log.Fatalf("Fiber server error: %v", err)
+			logger.Fatal("Fiber server error", zap.Error(err))
 		}
 	}()
 	for i := 0; i < 5; i++ {
@@ -973,12 +1007,11 @@ func main() {
 	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-	log.Println("Shutdown signal received, shutting down system...")
+	sig := <-shutdownChan
+	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": sig})
 	if err := app.Shutdown(); err != nil {
-		log.Printf("Fiber shutdown error: %v", err)
+		structuredLog("shutdown", "Fiber shutdown error", map[string]any{"error": err.Error()})
 	}
 	system.Shutdown()
+	os.Exit(0)
 }
