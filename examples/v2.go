@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -37,7 +38,7 @@ func initLogger() {
 	if err != nil {
 		log.Fatalf("Failed to initialize Zap logger: %v", err)
 	}
-	// Seed random generator for jitter calculations.
+
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -481,7 +482,7 @@ func (cell *actorCell) run() {
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("actor %s panicked: %v", cell.ref.pid, r)
-				// Log the panic error with a stack trace for easier debugging.
+
 				structuredLog("actor_system", "Panic recovered", map[string]any{
 					"actor": cell.ref.pid, "error": err.Error(), "stack": string(debug.Stack()),
 				})
@@ -550,7 +551,7 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 		return
 	}
 	structuredLog("supervision", "Restarting actor", map[string]any{"actor": actorID, "attempt": count + 1})
-	// Add jitter to delay for more robust backoff.
+
 	jitter := time.Duration(rand.Int63n(int64(s.backoff)))
 	delay := time.Duration(math.Pow(2, float64(count)))*s.backoff + jitter
 	time.Sleep(delay)
@@ -590,11 +591,24 @@ type RemoteTransport interface {
 }
 
 type JSONRemoteTransport struct {
-	endpoint string
-	client   *http.Client
+	endpoint       string
+	client         *http.Client
+	failureCount   int
+	circuitOpen    bool
+	lastFailure    time.Time
+	breakerTimeout time.Duration
 }
 
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
+
+	if t.circuitOpen {
+		if time.Since(t.lastFailure) < t.breakerTimeout {
+			return fmt.Errorf("circuit breaker open: skipping remote call")
+		} else {
+			t.circuitOpen = false
+			t.failureCount = 0
+		}
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("serialization error: %w", err)
@@ -611,11 +625,19 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 		}
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+
+			t.failureCount = 0
 			return nil
 		} else {
 			lastErr = fmt.Errorf("remote endpoint returned status: %s", resp.Status)
 			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
 		}
+	}
+	t.failureCount++
+	t.lastFailure = time.Now()
+	if t.failureCount >= 3 {
+		t.circuitOpen = true
+		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID})
 	}
 	return fmt.Errorf("failed to send remote message after %d attempts: %w", maxRetries, lastErr)
 }
@@ -635,11 +657,15 @@ func NewActorSystem(cfg *Config) *ActorSystem {
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
 	startTimeCtx := context.WithValue(ctx, startTimeKey, time.Now())
 	return &ActorSystem{
-		ctx:             startTimeCtx,
-		cancel:          cancel,
-		supervisor:      supervisor,
-		remoteTransport: &JSONRemoteTransport{endpoint: cfg.RemoteEndpoint, client: &http.Client{Timeout: 10 * time.Second}},
-		config:          cfg,
+		ctx:        startTimeCtx,
+		cancel:     cancel,
+		supervisor: supervisor,
+		remoteTransport: &JSONRemoteTransport{
+			endpoint:       cfg.RemoteEndpoint,
+			client:         &http.Client{Timeout: 10 * time.Second},
+			breakerTimeout: 5 * time.Second,
+		},
+		config: cfg,
 	}
 }
 
@@ -698,7 +724,7 @@ func (sys *ActorSystem) Shutdown() {
 	})
 	stopDeadLetterProcessor()
 	sys.cancel()
-	// Removed arbitrary sleep. The cancellation now takes effect immediately.
+
 	structuredLog("shutdown", "Actor system shutdown complete", nil)
 }
 
@@ -914,11 +940,15 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 }
 
 func main() {
+
+	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
+	flag.Parse()
+
 	initLogger()
-	// Ensure all log entries are flushed on exit.
+
 	defer logger.Sync()
 	startedAt := time.Now()
-	cfg, err := LoadConfig("config.yaml")
+	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		logger.Fatal("Failed to load config", zap.Error(err))
 	}
@@ -993,7 +1023,7 @@ func main() {
 			"start_time":    system.ctx.Value(startTimeKey),
 		})
 	})
-	// Graceful shutdown of Fiber server and Actor system on SIGTERM or SIGINT.
+
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -1020,7 +1050,11 @@ func main() {
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	sig := <-shutdownChan
 	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": sig})
-	if err := app.Shutdown(); err != nil {
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+
+	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		structuredLog("shutdown", "Fiber shutdown error", map[string]any{"error": err.Error()})
 	}
 	system.Shutdown()
