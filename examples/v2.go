@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -605,6 +606,7 @@ type JSONRemoteTransport struct {
 	breakerTimeout time.Duration
 }
 
+// Enhancement: Improved circuit breaker logic in JSONRemoteTransport.SendRemote with jittered exponential backoff and detailed logging.
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
@@ -619,30 +621,32 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 		return fmt.Errorf("serialization error: %w", err)
 	}
 	maxRetries := 3
-	var attempt int
 	var lastErr error
-	for attempt = 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
-			continue
-		}
-		bodyBytes, _ := io.ReadAll(resp.Body) // enhanced logging: read response body
-		resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			t.failureCount = 0
-			return nil
 		} else {
-			lastErr = fmt.Errorf("remote endpoint returned status: %s, response: %s", resp.Status, string(bodyBytes))
-			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
+			bodyBytes, _ := io.ReadAll(resp.Body) // enhanced logging: read response body
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				t.failureCount = 0
+				return nil
+			} else {
+				lastErr = fmt.Errorf("remote endpoint returned status: %s, response: %s", resp.Status, string(bodyBytes))
+			}
 		}
+		// Improved backoff with jitter
+		baseDelay := 100 * time.Millisecond
+		backoff := time.Duration(math.Pow(2, float64(attempt))) * baseDelay
+		jitter := time.Duration(rand.Int63n(50 * int64(time.Millisecond)))
+		time.Sleep(backoff + jitter)
 	}
 	t.failureCount++
 	t.lastFailure = time.Now()
 	if t.failureCount >= 3 {
 		t.circuitOpen = true
-		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID})
+		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID, "failureCount": t.failureCount})
 	}
 	return fmt.Errorf("failed to send remote message after %d attempts: %w", maxRetries, lastErr)
 }
@@ -1066,6 +1070,16 @@ func main() {
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	sig := <-shutdownChan
 	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": sig})
+
+	// Log memory stats for diagnostics
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	structuredLog("shutdown", "Memory stats", map[string]any{
+		"Alloc":      m.Alloc,
+		"TotalAlloc": m.TotalAlloc,
+		"Sys":        m.Sys,
+		"NumGC":      m.NumGC,
+	})
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
