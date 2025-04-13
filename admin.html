@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Actor System Monitor</title>
+	<script>
+	function loadActors() {
+		fetch('/admin/api/actors')
+			.then(res => res.json())
+			.then(data => {
+				let list = document.getElementById('actorList');
+				list.innerHTML = '';
+				data.forEach(actor => {
+					list.innerHTML += '<li>' + actor.pid + ' (Mailbox Type: ' + actor.mailboxType + ') ' +
+					'<button onclick="stopActor(\''+actor.pid+'\')">Stop</button></li>';
+				});
+			});
+	}
+	function stopActor(pid) {
+		fetch('/admin/api/actors/' + pid + '/stop', { method: 'POST' })
+			.then(res => res.json())
+			.then(data => {
+				alert(data.message);
+				loadActors();
+			});
+	}
+	function loadMetrics() {
+		fetch('/metrics')
+			.then(res => res.json())
+			.then(data => {
+				document.getElementById('metrics').innerText = JSON.stringify(data, null, 2);
+			});
+	}
+	window.onload = function() {
+		loadActors();
+		loadMetrics();
+	}
+	</script>
+</head>
+<body>
+	<h1>Actor System Monitor</h1>
+	<h2>Actors</h2>
+	<ul id="actorList"></ul>
+	<h2>Metrics</h2>
+	<pre id="metrics"></pre>
+</body>
+</html>

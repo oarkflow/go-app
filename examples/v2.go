@@ -826,6 +826,21 @@ func (sys *ActorSystem) ServeHealthCheck(addr string) {
 	}()
 }
 
+// Add new method to list actors in the actor system.
+func (sys *ActorSystem) ListActors() []map[string]any {
+	var actors []map[string]any
+	sys.registry.Range(func(key, value any) bool {
+		cell := value.(*actorCell)
+		actors = append(actors, map[string]any{
+			"pid":         cell.ref.pid,
+			"mailboxType": cell.props.MailboxType,
+			// Additional metrics can be added here.
+		})
+		return true
+	})
+	return actors
+}
+
 type Router struct {
 	actors  []*ActorRef
 	counter uint64
@@ -1114,6 +1129,27 @@ func main() {
 			"start_time":    system.ctx.Value(startTimeKey),
 		})
 	})
+
+	// New routes for admin UI and API for actor monitoring and management.
+	app.Get("/admin/ui", func(c *fiber.Ctx) error {
+		// Serve the static HTML file for the admin UI.
+		return c.Type("html").SendFile("/Users/sujit/Sites/go-app/admin.html")
+	})
+
+	// API: List actors
+	app.Get("/admin/api/actors", func(c *fiber.Ctx) error {
+		actors := system.ListActors()
+		return c.JSON(actors)
+	})
+	// API: Stop an actor by its id
+	app.Post("/admin/api/actors/:id/stop", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		if err := system.Stop(actorID); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"message": "Actor " + actorID + " stopped"})
+	})
+	// Optionally more actor operations (restart, etc.) can be added here.
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
