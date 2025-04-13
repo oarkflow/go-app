@@ -10,8 +10,10 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -587,11 +589,14 @@ func NewActorSystem(cfg *Config) *ActorSystem {
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
 	startTimeCtx := context.WithValue(ctx, "startTime", time.Now())
 	return &ActorSystem{
-		ctx:             startTimeCtx,
-		cancel:          cancel,
-		supervisor:      supervisor,
-		remoteTransport: &JSONRemoteTransport{endpoint: cfg.RemoteEndpoint, client: &http.Client{}},
-		config:          cfg,
+		ctx:        startTimeCtx,
+		cancel:     cancel,
+		supervisor: supervisor,
+		remoteTransport: &JSONRemoteTransport{
+			endpoint: cfg.RemoteEndpoint,
+			client:   &http.Client{Timeout: 10 * time.Second},
+		},
+		config: cfg,
 	}
 }
 
@@ -920,6 +925,13 @@ func main() {
 		duration := time.Since(start)
 		return c.JSON(map[string]any{"messages": iterations, "duration_ms": duration.Milliseconds()})
 	})
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		metricsData := map[string]any{
+			"active_actors": system.activeActors.Load(),
+			"start_time":    system.ctx.Value("startTime"),
+		}
+		return c.JSON(metricsData)
+	})
 	go func() {
 		if err := app.Listen(cfg.HTTPPort); err != nil {
 			log.Fatalf("Fiber server error: %v", err)
@@ -942,5 +954,12 @@ func main() {
 	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
-	select {}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+	log.Println("Shutdown signal received, shutting down system...")
+	if err := app.Shutdown(); err != nil {
+		log.Printf("Fiber shutdown error: %v", err)
+	}
+	system.Shutdown()
 }
