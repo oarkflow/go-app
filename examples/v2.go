@@ -1141,6 +1141,14 @@ func main() {
 		actors := system.ListActors()
 		return c.JSON(actors)
 	})
+	app.Get("/admin/api/actors/:id/events", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		events, err := eventLogger.GetEvents(actorID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"actor": actorID, "events": events})
+	})
 	// API: Stop an actor by its id
 	app.Post("/admin/api/actors/:id/stop", func(c *fiber.Ctx) error {
 		actorID := c.Params("id")
