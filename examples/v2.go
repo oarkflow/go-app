@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 )
 
@@ -230,40 +232,37 @@ func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx Actor
 }
 
 func RateLimitingInterceptor(maxPerSec int) MessageInterceptor {
-	var mu sync.Mutex
-	var count int
-	ticker := time.NewTicker(1 * time.Second)
-	go func() {
-		for range ticker.C {
-			mu.Lock()
-			count = 0
-			mu.Unlock()
-		}
-	}()
+	limiter := rate.NewLimiter(rate.Limit(maxPerSec), maxPerSec)
 	return func(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
 		return func(ctx ActorContext, msg Message) {
-			mu.Lock()
-			if count >= maxPerSec {
-				mu.Unlock()
+			if !limiter.Allow() {
 				structuredLog("interceptor", "Rate limit exceeded", map[string]any{"actor": ctx.Self.pid, "message": msg})
 				metrics.Increment("messages.dropped")
 				return
 			}
-			count++
-			mu.Unlock()
 			next(ctx, msg)
 		}
 	}
 }
 
-var deadLetterQueue = make(chan Message, 10000)
+var (
+	deadLetterQueue = make(chan Message, 10000)
+	deadLetterWg    sync.WaitGroup
+)
 
 func startDeadLetterProcessor() {
+	deadLetterWg.Add(1)
 	go func() {
+		defer deadLetterWg.Done()
 		for msg := range deadLetterQueue {
 			structuredLog("deadletter", "Processing dead-letter message", map[string]any{"message": msg})
 		}
 	}()
+}
+
+func stopDeadLetterProcessor() {
+	close(deadLetterQueue)
+	deadLetterWg.Wait()
 }
 
 func enqueueDeadLetter(msg Message) {
@@ -570,7 +569,14 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 		return fmt.Errorf("serialization error: %w", err)
 	}
 	structuredLog("remote", "Sending remote message", map[string]any{"actor": actorID, "data": string(data)})
-	http.Post(t.endpoint, "application/json", nil)
+	resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("HTTP POST error: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("remote endpoint returned status: %s", resp.Status)
+	}
 	return nil
 }
 
@@ -653,6 +659,7 @@ func (sys *ActorSystem) Shutdown() {
 		sys.activeActors.Add(-1)
 		return true
 	})
+	stopDeadLetterProcessor()
 	sys.cancel()
 	time.Sleep(500 * time.Millisecond)
 	structuredLog("shutdown", "Actor system shutdown complete", nil)
