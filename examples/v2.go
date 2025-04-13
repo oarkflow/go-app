@@ -34,18 +34,18 @@ type contextKey string
 const startTimeKey contextKey = "startTime"
 
 var logger *zap.Logger
+var actorRestartCount atomic.Int64
 
 func initLogger() {
 	var err error
-	logger, err = zap.NewProduction()
+
+	logger, err = zap.NewProduction(zap.AddCaller())
 	if err != nil {
-		// Fallback to development logger if production fails
-		logger, err = zap.NewDevelopment()
+		logger, err = zap.NewDevelopment(zap.AddCaller())
 		if err != nil {
 			log.Fatalf("Failed to initialize any logger: %v", err)
 		}
 	}
-
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -252,7 +252,13 @@ var metrics Metrics = &DummyMetrics{}
 
 func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
 	return func(ctx ActorContext, msg Message) {
-		structuredLog("interceptor", "Processing message", map[string]any{"actor": ctx.Self.pid, "message": msg})
+		corrID := ""
+		if id := ctx.Context.Value("correlation_id"); id != nil {
+			corrID = fmt.Sprintf("%v", id)
+		}
+		structuredLog("interceptor", "Processing message", map[string]any{
+			"actor": ctx.Self.pid, "message": msg, "correlation_id": corrID,
+		})
 		metrics.Increment("messages.processed")
 		next(ctx, msg)
 	}
@@ -557,26 +563,31 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 		structuredLog("supervision", "Max restarts exceeded", map[string]any{"actor": actorID})
 		return
 	}
-	structuredLog("supervision", "Restarting actor", map[string]any{"actor": actorID, "attempt": count + 1})
+	structuredLog("supervision", "Scheduling actor restart", map[string]any{"actor": actorID, "attempt": count + 1})
+
+	actorRestartCount.Add(1)
 
 	jitter := time.Duration(rand.Int63n(int64(s.backoff)))
 	delay := time.Duration(math.Pow(2, float64(count)))*s.backoff + jitter
-	time.Sleep(delay)
-	s.restarts.Store(actorID, count+1)
-	actorCtx := ActorContext{
-		Self:    child.ref,
-		Context: child.ctx,
-	}
-	child.actor.PreRestart(actorCtx, reason)
-	child.mu.Lock()
-	if child.props.MailboxType == MailboxPriority {
-		child.mailbox = NewPriorityMailbox()
-	} else {
-		child.mailbox = NewStandardMailbox(child.props.MailboxSize)
-	}
-	child.ref.mailbox = child.mailbox
-	child.mu.Unlock()
-	child.run()
+
+	go func() {
+		time.Sleep(delay)
+		s.restarts.Store(actorID, count+1)
+		actorCtx := ActorContext{
+			Self:    child.ref,
+			Context: child.ctx,
+		}
+		child.actor.PreRestart(actorCtx, reason)
+		child.mu.Lock()
+		if child.props.MailboxType == MailboxPriority {
+			child.mailbox = NewPriorityMailbox()
+		} else {
+			child.mailbox = NewStandardMailbox(child.props.MailboxSize)
+		}
+		child.ref.mailbox = child.mailbox
+		child.mu.Unlock()
+		child.run()
+	}()
 }
 
 type ActorProps struct {
@@ -606,7 +617,6 @@ type JSONRemoteTransport struct {
 	breakerTimeout time.Duration
 }
 
-// Enhancement: Improved circuit breaker logic in JSONRemoteTransport.SendRemote with jittered exponential backoff and detailed logging.
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
@@ -627,7 +637,7 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 		if err != nil {
 			lastErr = err
 		} else {
-			bodyBytes, _ := io.ReadAll(resp.Body) // enhanced logging: read response body
+			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				t.failureCount = 0
@@ -636,7 +646,6 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 				lastErr = fmt.Errorf("remote endpoint returned status: %s, response: %s", resp.Status, string(bodyBytes))
 			}
 		}
-		// Improved backoff with jitter
 		baseDelay := 100 * time.Millisecond
 		backoff := time.Duration(math.Pow(2, float64(attempt))) * baseDelay
 		jitter := time.Duration(rand.Int63n(50 * int64(time.Millisecond)))
@@ -819,9 +828,10 @@ type ActorContext struct {
 }
 
 type RequestMessage struct {
-	ID      string
-	Payload string
-	Reply   chan ResponseMessage
+	ID            string
+	Payload       string
+	Reply         chan ResponseMessage
+	CorrelationID string
 }
 
 type RequestHandlerActor struct{}
@@ -970,7 +980,7 @@ func main() {
 		LoggingInterceptor,
 		RateLimitingInterceptor(cfg.RateLimitPerSecond),
 	}
-	// Enhanced Fiber config with timeouts and custom error handling
+
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -980,7 +990,7 @@ func main() {
 			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		},
 	})
-	// Add recovery middleware to catch panics in Fiber handlers
+
 	app.Use(recoverMw.New())
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
@@ -1012,11 +1022,14 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).SendString("Invalid or missing 'data' field")
 		}
 		reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+
+		corrID := c.Get("X-Correlation-ID", "")
 		replyChan := make(chan ResponseMessage, 1)
 		reqMsg := RequestMessage{
-			ID:      reqID,
-			Payload: data,
-			Reply:   replyChan,
+			ID:            reqID,
+			Payload:       data,
+			Reply:         replyChan,
+			CorrelationID: corrID,
 		}
 		if err := reqHandlerRef.Tell(reqMsg); err != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString("Actor error")
@@ -1071,7 +1084,6 @@ func main() {
 	sig := <-shutdownChan
 	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": sig})
 
-	// Log memory stats for diagnostics
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	structuredLog("shutdown", "Memory stats", map[string]any{
