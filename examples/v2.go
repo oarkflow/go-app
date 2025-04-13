@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -35,6 +37,8 @@ func initLogger() {
 	if err != nil {
 		log.Fatalf("Failed to initialize Zap logger: %v", err)
 	}
+	// Seed random generator for jitter calculations.
+	rand.Seed(time.Now().UnixNano())
 }
 
 type Config struct {
@@ -477,7 +481,10 @@ func (cell *actorCell) run() {
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("actor %s panicked: %v", cell.ref.pid, r)
-				structuredLog("actor_system", "Panic recovered", map[string]any{"actor": cell.ref.pid, "error": err.Error()})
+				// Log the panic error with a stack trace for easier debugging.
+				structuredLog("actor_system", "Panic recovered", map[string]any{
+					"actor": cell.ref.pid, "error": err.Error(), "stack": string(debug.Stack()),
+				})
 				if cell.parent != nil && cell.parent.supervisor != nil {
 					cell.parent.supervisor.HandleFailure(cell, err)
 				}
@@ -543,7 +550,9 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 		return
 	}
 	structuredLog("supervision", "Restarting actor", map[string]any{"actor": actorID, "attempt": count + 1})
-	delay := time.Duration(math.Pow(2, float64(count))) * s.backoff
+	// Add jitter to delay for more robust backoff.
+	jitter := time.Duration(rand.Int63n(int64(s.backoff)))
+	delay := time.Duration(math.Pow(2, float64(count)))*s.backoff + jitter
 	time.Sleep(delay)
 	s.restarts.Store(actorID, count+1)
 	actorCtx := ActorContext{
@@ -689,7 +698,7 @@ func (sys *ActorSystem) Shutdown() {
 	})
 	stopDeadLetterProcessor()
 	sys.cancel()
-	time.Sleep(500 * time.Millisecond)
+	// Removed arbitrary sleep. The cancellation now takes effect immediately.
 	structuredLog("shutdown", "Actor system shutdown complete", nil)
 }
 
@@ -906,6 +915,8 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 
 func main() {
 	initLogger()
+	// Ensure all log entries are flushed on exit.
+	defer logger.Sync()
 	startedAt := time.Now()
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
