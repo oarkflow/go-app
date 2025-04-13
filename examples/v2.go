@@ -414,6 +414,13 @@ func (m *StandardMailbox) Close() {
 	close(m.ch)
 }
 
+// Add a pool for PriorityMessage to reduce allocations
+var priorityMessagePool = sync.Pool{
+	New: func() any {
+		return new(PriorityMessage)
+	},
+}
+
 type PriorityMessage struct {
 	priority int
 	message  Message
@@ -433,6 +440,7 @@ func NewPriorityMailbox() *PriorityMailbox {
 	return pm
 }
 
+// Modify PriorityMailbox.Enqueue to obtain a PriorityMessage from the pool.
 func (pm *PriorityMailbox) Enqueue(message Message) error {
 	var p int
 	if pe, ok := message.(PriorityEnvelope); ok {
@@ -446,11 +454,16 @@ func (pm *PriorityMailbox) Enqueue(message Message) error {
 	if pm.closed {
 		return errors.New("mailbox closed")
 	}
-	heap.Push(&pm.messages, &PriorityMessage{priority: p, message: message})
+	// Use pooled PriorityMessage
+	pmsg := priorityMessagePool.Get().(*PriorityMessage)
+	pmsg.priority = p
+	pmsg.message = message
+	heap.Push(&pm.messages, pmsg)
 	pm.cond.Signal()
 	return nil
 }
 
+// Modify PriorityMailbox.Dequeue to return the message and recycle the PriorityMessage.
 func (pm *PriorityMailbox) Dequeue() (Message, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -461,7 +474,11 @@ func (pm *PriorityMailbox) Dequeue() (Message, bool) {
 		return nil, false
 	}
 	pmsg := heap.Pop(&pm.messages).(*PriorityMessage)
-	return pmsg.message, true
+	msg := pmsg.message
+	// Reset and return the PriorityMessage to the pool
+	pmsg.priority, pmsg.message, pmsg.index = 0, nil, 0
+	priorityMessagePool.Put(pmsg)
+	return msg, true
 }
 
 func (pm *PriorityMailbox) Close() {
@@ -631,16 +648,18 @@ type RemoteTransport interface {
 	SendRemote(actorID string, msg Message) error
 }
 
+// Enhance JSONRemoteTransport with a configurable failure threshold for its circuit breaker
 type JSONRemoteTransport struct {
-	endpoint       string
-	client         *http.Client
-	failureCount   int
-	circuitOpen    bool
-	lastFailure    time.Time
-	breakerTimeout time.Duration
+	endpoint         string
+	client           *http.Client
+	failureCount     int
+	circuitOpen      bool
+	lastFailure      time.Time
+	breakerTimeout   time.Duration
+	FailureThreshold int // new field: number of failures before opening the circuit
 }
 
-// Modified JSONRemoteTransport.SendRemote with enhanced logging and circuit breaker reset.
+// In SendRemote, use the new FailureThreshold field.
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
@@ -680,7 +699,7 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	}
 	t.failureCount++
 	t.lastFailure = time.Now()
-	if t.failureCount >= 3 {
+	if t.failureCount >= t.FailureThreshold {
 		t.circuitOpen = true
 		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID, "failureCount": t.failureCount})
 	}
@@ -698,6 +717,7 @@ type ActorSystem struct {
 	activeActors    atomic.Int32
 }
 
+// In NewActorSystem, initialize JSONRemoteTransport with the desired failure threshold.
 func NewActorSystem(cfg *Config) *ActorSystem {
 	ctx, cancel := context.WithCancel(context.Background())
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
@@ -707,9 +727,10 @@ func NewActorSystem(cfg *Config) *ActorSystem {
 		cancel:     cancel,
 		supervisor: supervisor,
 		remoteTransport: &JSONRemoteTransport{
-			endpoint:       cfg.RemoteEndpoint,
-			client:         &http.Client{Timeout: 10 * time.Second},
-			breakerTimeout: 5 * time.Second,
+			endpoint:         cfg.RemoteEndpoint,
+			client:           &http.Client{Timeout: 10 * time.Second},
+			breakerTimeout:   5 * time.Second,
+			FailureThreshold: 3, // set failure threshold
 		},
 		config: cfg,
 	}
@@ -770,7 +791,7 @@ func (sys *ActorSystem) Shutdown() {
 	})
 	stopDeadLetterProcessor()
 	sys.cancel()
-
+	time.Sleep(100 * time.Millisecond)
 	structuredLog("shutdown", "Actor system shutdown complete", nil)
 }
 
