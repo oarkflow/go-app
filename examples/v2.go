@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	recoverMw "github.com/gofiber/fiber/v2/middleware/recover"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
@@ -36,7 +38,11 @@ func initLogger() {
 	var err error
 	logger, err = zap.NewProduction()
 	if err != nil {
-		log.Fatalf("Failed to initialize Zap logger: %v", err)
+		// Fallback to development logger if production fails
+		logger, err = zap.NewDevelopment()
+		if err != nil {
+			log.Fatalf("Failed to initialize any logger: %v", err)
+		}
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -600,7 +606,6 @@ type JSONRemoteTransport struct {
 }
 
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
-
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
 			return fmt.Errorf("circuit breaker open: skipping remote call")
@@ -623,13 +628,13 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
 			continue
 		}
+		bodyBytes, _ := io.ReadAll(resp.Body) // enhanced logging: read response body
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-
 			t.failureCount = 0
 			return nil
 		} else {
-			lastErr = fmt.Errorf("remote endpoint returned status: %s", resp.Status)
+			lastErr = fmt.Errorf("remote endpoint returned status: %s, response: %s", resp.Status, string(bodyBytes))
 			time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * 100 * time.Millisecond)
 		}
 	}
@@ -961,6 +966,18 @@ func main() {
 		LoggingInterceptor,
 		RateLimitingInterceptor(cfg.RateLimitPerSecond),
 	}
+	// Enhanced Fiber config with timeouts and custom error handling
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  10 * time.Second,
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			structuredLog("fiber", "Unhandled error", map[string]any{"error": err.Error()})
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		},
+	})
+	// Add recovery middleware to catch panics in Fiber handlers
+	app.Use(recoverMw.New())
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
@@ -975,7 +992,6 @@ func main() {
 		poolRefs = append(poolRefs, ref)
 	}
 	router := NewRoundRobinRouter(poolRefs)
-	app := fiber.New()
 	reqHandler := &RequestHandlerActor{}
 	reqHandlerRef := system.Spawn("reqHandler", reqHandler, ActorProps{
 		MailboxSize:  1024,
