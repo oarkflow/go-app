@@ -1034,6 +1034,36 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "PersistentActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
+type RequestWrapperActor struct {
+	id      string
+	handler func(payload string) (string, error)
+}
+
+func (a *RequestWrapperActor) PreStart(ctx ActorContext) {
+	structuredLog("actor", "RequestWrapperActor starting", map[string]any{"actor": a.id})
+}
+
+func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
+	switch req := msg.(type) {
+	case RequestMessage:
+		structuredLog("actor", "RequestWrapperActor processing", map[string]any{"actor": a.id, "payload": req.Payload})
+		res, err := a.handler(req.Payload)
+		if req.Reply != nil {
+			req.Reply <- ResponseMessage{Data: res, Err: err}
+		}
+	default:
+		structuredLog("actor", "RequestWrapperActor unknown message", map[string]any{"actor": a.id, "message": msg})
+	}
+}
+
+func (a *RequestWrapperActor) PostStop(ctx ActorContext) {
+	structuredLog("actor", "RequestWrapperActor stopping", map[string]any{"actor": a.id})
+}
+
+func (a *RequestWrapperActor) PreRestart(ctx ActorContext, reason error) {
+	structuredLog("actor", "RequestWrapperActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
 	flag.Parse()
@@ -1115,12 +1145,20 @@ func main() {
 		poolRefs = append(poolRefs, ref)
 	}
 	router := NewRoundRobinRouter(poolRefs)
-	reqHandler := &RequestHandlerActor{}
-	reqHandlerRef := system.Spawn("reqHandler", reqHandler, ActorProps{
-		MailboxSize:  1024,
+	timerActor := &TimerActor{name: "Timer1"}
+	system.Spawn("timer1", timerActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
 		Interceptors: interceptors,
 	})
+	persistentActor := &PersistentActor{name: "Persist1"}
+	system.Spawn("persist1", persistentActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize + 5,
+		MailboxType:  MailboxStandard,
+		Interceptors: interceptors,
+	})
+	globalPubSub.Subscribe("news", echoRef)
+	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	app.Post("/process", func(c *fiber.Ctx) error {
 		var payload map[string]any
 		if err := c.BodyParser(&payload); err != nil {
@@ -1130,7 +1168,7 @@ func main() {
 		if !ok || data == "" {
 			return c.Status(fiber.StatusBadRequest).SendString("Invalid or missing 'data' field")
 		}
-		reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+		reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
 		corrID := c.Get("X-Correlation-ID", "")
 		replyChan := make(chan ResponseMessage, 1)
 		reqMsg := RequestMessage{
@@ -1139,13 +1177,32 @@ func main() {
 			Reply:         replyChan,
 			CorrelationID: corrID,
 		}
-		if err := reqHandlerRef.Tell(reqMsg); err != nil {
+		handler := func(payload string) (string, error) {
+			structuredLog("handler", "Processing request payload", map[string]any{"actor": reqID, "payload": payload})
+			time.Sleep(100 * time.Millisecond)
+			return fmt.Sprintf("Processed request %s with payload: %s", reqID, payload), nil
+		}
+		requestActor := &RequestWrapperActor{
+			id:      reqID,
+			handler: handler,
+		}
+		actorRef := system.Spawn(reqID, requestActor, ActorProps{
+			MailboxSize:  cfg.MailboxSize,
+			MailboxType:  MailboxStandard,
+			Interceptors: interceptors,
+		})
+		if err := actorRef.Tell(reqMsg); err != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString("Actor error")
 		}
 		select {
 		case resp := <-replyChan:
+			_ = system.Stop(reqID)
+			if resp.Err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(map[string]any{"error": resp.Err.Error()})
+			}
 			return c.JSON(map[string]any{"response": resp.Data})
 		case <-time.After(3 * time.Second):
+			_ = system.Stop(reqID)
 			return c.Status(fiber.StatusGatewayTimeout).SendString("Timeout")
 		}
 	})
@@ -1174,20 +1231,6 @@ func main() {
 	for i := 0; i < 5; i++ {
 		router.Route(fmt.Sprintf("Route Message #%d", i+1))
 	}
-	timerActor := &TimerActor{name: "Timer1"}
-	system.Spawn("timer1", timerActor, ActorProps{
-		MailboxSize:  cfg.MailboxSize,
-		MailboxType:  MailboxStandard,
-		Interceptors: interceptors,
-	})
-	persistentActor := &PersistentActor{name: "Persist1"}
-	system.Spawn("persist1", persistentActor, ActorProps{
-		MailboxSize:  cfg.MailboxSize + 5,
-		MailboxType:  MailboxStandard,
-		Interceptors: interceptors,
-	})
-	globalPubSub.Subscribe("news", echoRef)
-	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	structuredLog("shutdown", "Memory stats", map[string]any{
