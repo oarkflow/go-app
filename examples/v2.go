@@ -24,6 +24,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	recoverMw "github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/vmihailenco/msgpack/v5"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
@@ -126,11 +127,20 @@ type ResponseMessage struct {
 	Err  error
 }
 
+var envelopePool = sync.Pool{
+	New: func() any { return new(Envelope) },
+}
+var respChanPool = sync.Pool{
+	New: func() any { return make(chan ResponseMessage, 1) },
+}
+
 type Actor interface {
 	PreStart(ctx ActorContext)
 	Receive(ctx ActorContext, message Message)
 	PostStop(ctx ActorContext)
 	PreRestart(ctx ActorContext, reason error)
+	AfterRestart(ctx ActorContext)   // New hook after restart
+	BeforeShutdown(ctx ActorContext) // New hook before shutdown
 }
 
 type Behavior func(ctx ActorContext, msg Message)
@@ -167,6 +177,9 @@ func (b *BaseActor) DefaultReceive(ctx ActorContext, msg Message) {
 		beh(ctx, msg)
 	}
 }
+
+func (b *BaseActor) AfterRestart(ctx ActorContext)   { /* no-op default */ }
+func (b *BaseActor) BeforeShutdown(ctx ActorContext) { /* no-op default */ }
 
 type Persistence interface {
 	SaveSnapshot(actorID string, state any) error
@@ -383,7 +396,14 @@ func (r *ActorRef) Tell(message Message) error {
 }
 
 func (r *ActorRef) Ask(message Message, timeout time.Duration) (ResponseMessage, error) {
-	replyChan := make(chan ResponseMessage, 1)
+	replyChan := respChanPool.Get().(chan ResponseMessage)
+	defer func() {
+		// Drain replyChan before putting back into pool.
+		for len(replyChan) > 0 {
+			<-replyChan
+		}
+		respChanPool.Put(replyChan)
+	}()
 	envelope := Envelope{Message: message, ReplyChan: replyChan}
 	if err := r.mailbox.Enqueue(envelope); err != nil {
 		return ResponseMessage{}, err
@@ -599,6 +619,13 @@ func (cell *actorCell) run() {
 }
 
 func (cell *actorCell) stop() {
+	actorCtx := ActorContext{
+		Self:       cell.ref,
+		Parent:     nil,
+		Context:    cell.ctx,
+		CancelFunc: cell.cancel,
+	}
+	cell.actor.BeforeShutdown(actorCtx)
 	cell.cancel()
 	cell.mailbox.Close()
 	cell.wg.Wait()
@@ -642,7 +669,9 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 		}
 		child.ref.mailbox = child.mailbox
 		child.mu.Unlock()
+		// Start the actor and then call AfterRestart hook.
 		child.run()
+		child.actor.AfterRestart(actorCtx)
 	}()
 }
 
@@ -672,6 +701,7 @@ type JSONRemoteTransport struct {
 	lastFailure      time.Time
 	breakerTimeout   time.Duration
 	FailureThreshold int
+	useMsgPack       bool // New: if true, use msgpack instead of JSON
 }
 
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
@@ -685,7 +715,14 @@ func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 			structuredLog("remote", "Circuit breaker reset", map[string]any{"actor": actorID})
 		}
 	}
-	data, err := json.Marshal(msg)
+	var data []byte
+	var err error
+	if t.useMsgPack {
+		// Use msgpack for high-performance binary serialization.
+		data, err = msgpack.Marshal(msg)
+	} else {
+		data, err = json.Marshal(msg)
+	}
 	if err != nil {
 		return fmt.Errorf("serialization error: %w", err)
 	}
@@ -935,6 +972,14 @@ func (a *RequestHandlerActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "RequestHandlerActor restarting", map[string]any{"reason": reason.Error()})
 }
 
+func (a *RequestHandlerActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "RequestHandlerActor after restart", nil)
+}
+
+func (a *RequestHandlerActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "RequestHandlerActor before shutdown", nil)
+}
+
 type EchoActor struct {
 	name string
 	BaseActor
@@ -966,6 +1011,14 @@ func (a *EchoActor) PostStop(ctx ActorContext) {
 
 func (a *EchoActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "EchoActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
+}
+
+func (a *EchoActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "EchoActor after restart", map[string]any{"actor": a.name})
+}
+
+func (a *EchoActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "EchoActor before shutdown", map[string]any{"actor": a.name})
 }
 
 type TimerActor struct {
@@ -1002,6 +1055,14 @@ func (a *TimerActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "TimerActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
+func (a *TimerActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "TimerActor after restart", map[string]any{"actor": a.name})
+}
+
+func (a *TimerActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "TimerActor before shutdown", map[string]any{"actor": a.name})
+}
+
 type PersistentActor struct {
 	name  string
 	state map[string]any
@@ -1033,6 +1094,14 @@ func (a *PersistentActor) PostStop(ctx ActorContext) {
 
 func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "PersistentActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
+}
+
+func (a *PersistentActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "PersistentActor after restart", map[string]any{"actor": a.name})
+}
+
+func (a *PersistentActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "PersistentActor before shutdown", map[string]any{"actor": a.name})
 }
 
 type RequestWrapperActor struct {
@@ -1072,6 +1141,14 @@ func (a *RequestWrapperActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "RequestWrapperActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
 }
 
+func (a *RequestWrapperActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "RequestWrapperActor after restart", map[string]any{"actor": a.id})
+}
+
+func (a *RequestWrapperActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "RequestWrapperActor before shutdown", map[string]any{"actor": a.id})
+}
+
 type RemoteActor struct {
 	id string
 }
@@ -1096,6 +1173,14 @@ func (a *RemoteActor) PostStop(ctx ActorContext) {
 
 func (a *RemoteActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "RemoteActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
+}
+
+func (a *RemoteActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "RemoteActor after restart", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "RemoteActor before shutdown", map[string]any{"actor": a.id})
 }
 
 type CombinedActor struct {
@@ -1150,6 +1235,14 @@ func (a *CombinedActor) PostStop(ctx ActorContext) {
 
 func (a *CombinedActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "CombinedActor restarting", map[string]any{"actor": "CombinedActor", "reason": reason.Error()})
+}
+
+func (a *CombinedActor) AfterRestart(ctx ActorContext) {
+	structuredLog("actor", "CombinedActor after restart", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) BeforeShutdown(ctx ActorContext) {
+	structuredLog("actor", "CombinedActor before shutdown", map[string]any{"actor": "CombinedActor"})
 }
 
 func main() {
