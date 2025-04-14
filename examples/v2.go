@@ -908,7 +908,7 @@ type RequestMessage struct {
 	Payload       string
 	Reply         chan ResponseMessage
 	CorrelationID string
-	FiberCtx      *fiber.Ctx // New field
+	FiberCtx      *fiber.Ctx
 }
 
 type RequestHandlerActor struct{}
@@ -1037,7 +1037,7 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 
 type RequestWrapperActor struct {
 	id      string
-	handler fiber.Handler // Changed type
+	handler fiber.Handler
 }
 
 func (a *RequestWrapperActor) PreStart(ctx ActorContext) {
@@ -1049,7 +1049,7 @@ func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
 	case RequestMessage:
 		structuredLog("actor", "RequestWrapperActor processing", map[string]any{"actor": a.id, "payload": req.Payload})
 		if req.FiberCtx != nil {
-			// Call the fiber.Handler with the provided *fiber.Ctx.
+
 			err := a.handler(req.FiberCtx)
 			if req.Reply != nil {
 				if err != nil {
@@ -1059,7 +1059,7 @@ func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
 				}
 			}
 		} else {
-			// Legacy handling code can go here if needed.
+
 		}
 	}
 }
@@ -1070,6 +1070,86 @@ func (a *RequestWrapperActor) PostStop(ctx ActorContext) {
 
 func (a *RequestWrapperActor) PreRestart(ctx ActorContext, reason error) {
 	structuredLog("actor", "RequestWrapperActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
+}
+
+type RemoteActor struct {
+	id string
+}
+
+func (a *RemoteActor) PreStart(ctx ActorContext) {
+	structuredLog("actor", "RemoteActor starting", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) Receive(ctx ActorContext, msg Message) {
+	err := ctx.Self.system.remoteTransport.SendRemote(ctx.Self.pid, msg)
+	if err != nil {
+		structuredLog("remoteActor", "Remote sending failed", map[string]any{"actor": a.id, "error": err.Error()})
+	}
+	if env, ok := msg.(Envelope); ok && env.ReplyChan != nil {
+		env.ReplyChan <- ResponseMessage{Data: fmt.Sprintf("Remote actor %s processed message", a.id), Err: err}
+	}
+}
+
+func (a *RemoteActor) PostStop(ctx ActorContext) {
+	structuredLog("actor", "RemoteActor stopping", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) PreRestart(ctx ActorContext, reason error) {
+	structuredLog("actor", "RemoteActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
+}
+
+type CombinedActor struct {
+	children []*ActorRef
+}
+
+func (a *CombinedActor) PreStart(ctx ActorContext) {
+	structuredLog("actor", "CombinedActor starting", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) Receive(ctx ActorContext, msg Message) {
+	switch req := msg.(type) {
+	case Envelope:
+		var wg sync.WaitGroup
+		mu := sync.Mutex{}
+		results := []string{}
+		for _, child := range a.children {
+			wg.Add(1)
+			go func(child *ActorRef) {
+				defer wg.Done()
+				request := RequestMessage{
+					ID:      fmt.Sprintf("child-req-%s", child.pid),
+					Payload: fmt.Sprintf("data from %s", child.pid),
+					Reply:   make(chan ResponseMessage, 1),
+				}
+				resp, err := child.system.Spawn(child.pid, nil, ActorProps{}).Ask(request, 2*time.Second)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					results = append(results, fmt.Sprintf("%s:error:%v", child.pid, err))
+				} else {
+					results = append(results, fmt.Sprintf("%s:%v", child.pid, resp.Data))
+				}
+			}(child)
+		}
+		wg.Wait()
+		aggregated := ""
+		for _, r := range results {
+			aggregated += r + "; "
+		}
+		if req.ReplyChan != nil {
+			req.ReplyChan <- ResponseMessage{Data: aggregated, Err: nil}
+		}
+	default:
+		structuredLog("actor", "CombinedActor received unknown message", map[string]any{"message": msg})
+	}
+}
+
+func (a *CombinedActor) PostStop(ctx ActorContext) {
+	structuredLog("actor", "CombinedActor stopping", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) PreRestart(ctx ActorContext, reason error) {
+	structuredLog("actor", "CombinedActor restarting", map[string]any{"actor": "CombinedActor", "reason": reason.Error()})
 }
 
 func main() {
@@ -1165,6 +1245,19 @@ func main() {
 		MailboxType:  MailboxStandard,
 		Interceptors: interceptors,
 	})
+	remoteActor := &RemoteActor{id: "Remote1"}
+	system.Spawn("remote1", remoteActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize,
+		MailboxType:  MailboxStandard,
+		Interceptors: interceptors,
+		Remote:       true,
+	})
+	combinedActor := &CombinedActor{children: poolRefs}
+	system.Spawn("combined1", combinedActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize,
+		MailboxType:  MailboxStandard,
+		Interceptors: interceptors,
+	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	app.Post("/process", func(c *fiber.Ctx) error {
@@ -1179,7 +1272,9 @@ func main() {
 		}
 		handler := func(c *fiber.Ctx) error {
 			structuredLog("handler", "Processing fiber request", map[string]any{"actor": reqID})
-			return nil
+			return c.JSON(map[string]string{
+				"result": "processed request via RequestWrapperActor",
+			})
 		}
 		requestActor := &RequestWrapperActor{
 			id:      reqID,
