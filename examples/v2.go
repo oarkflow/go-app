@@ -57,14 +57,14 @@ type Config struct {
 	HealthCheckEndpoint string        `yaml:"health_check_endpoint"`
 	RemoteEndpoint      string        `yaml:"remote_endpoint"`
 	HTTPPort            string        `yaml:"http_port"`
-	AdminToken          string        `yaml:"admin_token"` // new field for admin authentication
+	AdminToken          string        `yaml:"admin_token"`
 }
 
 func (cfg *Config) Validate() error {
 	if cfg.HTTPPort == "" {
 		return errors.New("HTTPPort must not be empty")
 	}
-	// ...additional validations as needed...
+
 	return nil
 }
 
@@ -104,7 +104,6 @@ func LoadConfig(filename string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Added dynamic configuration reloading using a background watcher.
 func watchConfig(filename string, currentCfg **Config, reloadInterval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(reloadInterval)
@@ -116,7 +115,7 @@ func watchConfig(filename string, currentCfg **Config, reloadInterval time.Durat
 				continue
 			}
 			*currentCfg = newCfg
-			structuredLog("config", "Config reloaded", map[string]any{"file": filename})
+
 		}
 	}()
 }
@@ -285,8 +284,16 @@ func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx Actor
 		if id := ctx.Context.Value("correlation_id"); id != nil {
 			corrID = fmt.Sprintf("%v", id)
 		}
+		var safeMsg any = msg
+		if req, ok := msg.(RequestMessage); ok {
+			safeMsg = map[string]any{
+				"ID":            req.ID,
+				"Payload":       req.Payload,
+				"CorrelationID": req.CorrelationID,
+			}
+		}
 		structuredLog("interceptor", "Processing message", map[string]any{
-			"actor": ctx.Self.pid, "message": msg, "correlation_id": corrID,
+			"actor": ctx.Self.pid, "message": safeMsg, "correlation_id": corrID,
 		})
 		metrics.Increment("messages.processed")
 		next(ctx, msg)
@@ -365,7 +372,7 @@ type ActorRef struct {
 
 func (r *ActorRef) Tell(message Message) error {
 	if !r.running.Load() {
-		return errors.New("actor not running")
+		return nil
 	}
 	err := r.mailbox.Enqueue(message)
 	if err != nil {
@@ -432,7 +439,6 @@ func (m *StandardMailbox) Close() {
 	close(m.ch)
 }
 
-// Add a pool for PriorityMessage to reduce allocations
 var priorityMessagePool = sync.Pool{
 	New: func() any {
 		return new(PriorityMessage)
@@ -458,7 +464,6 @@ func NewPriorityMailbox() *PriorityMailbox {
 	return pm
 }
 
-// Modify PriorityMailbox.Enqueue to obtain a PriorityMessage from the pool.
 func (pm *PriorityMailbox) Enqueue(message Message) error {
 	var p int
 	if pe, ok := message.(PriorityEnvelope); ok {
@@ -472,7 +477,6 @@ func (pm *PriorityMailbox) Enqueue(message Message) error {
 	if pm.closed {
 		return errors.New("mailbox closed")
 	}
-	// Use pooled PriorityMessage
 	pmsg := priorityMessagePool.Get().(*PriorityMessage)
 	pmsg.priority = p
 	pmsg.message = message
@@ -481,7 +485,6 @@ func (pm *PriorityMailbox) Enqueue(message Message) error {
 	return nil
 }
 
-// Modify PriorityMailbox.Dequeue to return the message and recycle the PriorityMessage.
 func (pm *PriorityMailbox) Dequeue() (Message, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -493,7 +496,6 @@ func (pm *PriorityMailbox) Dequeue() (Message, bool) {
 	}
 	pmsg := heap.Pop(&pm.messages).(*PriorityMessage)
 	msg := pmsg.message
-	// Reset and return the PriorityMessage to the pool
 	pmsg.priority, pmsg.message, pmsg.index = 0, nil, 0
 	priorityMessagePool.Put(pmsg)
 	return msg, true
@@ -553,7 +555,6 @@ func (cell *actorCell) run() {
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("actor %s panicked: %v", cell.ref.pid, r)
-
 				structuredLog("actor_system", "Panic recovered", map[string]any{
 					"actor": cell.ref.pid, "error": err.Error(), "stack": string(debug.Stack()),
 				})
@@ -622,12 +623,9 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 		return
 	}
 	structuredLog("supervision", "Scheduling actor restart", map[string]any{"actor": actorID, "attempt": count + 1})
-
 	actorRestartCount.Add(1)
-
 	jitter := time.Duration(rand.Int63n(int64(s.backoff)))
 	delay := time.Duration(math.Pow(2, float64(count)))*s.backoff + jitter
-
 	go func() {
 		time.Sleep(delay)
 		s.restarts.Store(actorID, count+1)
@@ -666,7 +664,6 @@ type RemoteTransport interface {
 	SendRemote(actorID string, msg Message) error
 }
 
-// Enhance JSONRemoteTransport with a configurable failure threshold for its circuit breaker
 type JSONRemoteTransport struct {
 	endpoint         string
 	client           *http.Client
@@ -674,10 +671,9 @@ type JSONRemoteTransport struct {
 	circuitOpen      bool
 	lastFailure      time.Time
 	breakerTimeout   time.Duration
-	FailureThreshold int // new field: number of failures before opening the circuit
+	FailureThreshold int
 }
 
-// In SendRemote, use the new FailureThreshold field.
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
 	if t.circuitOpen {
 		if time.Since(t.lastFailure) < t.breakerTimeout {
@@ -735,7 +731,6 @@ type ActorSystem struct {
 	activeActors    atomic.Int32
 }
 
-// In NewActorSystem, initialize JSONRemoteTransport with the desired failure threshold.
 func NewActorSystem(cfg *Config) *ActorSystem {
 	ctx, cancel := context.WithCancel(context.Background())
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
@@ -748,7 +743,7 @@ func NewActorSystem(cfg *Config) *ActorSystem {
 			endpoint:         cfg.RemoteEndpoint,
 			client:           &http.Client{Timeout: 10 * time.Second},
 			breakerTimeout:   5 * time.Second,
-			FailureThreshold: 3, // set failure threshold
+			FailureThreshold: 3,
 		},
 		config: cfg,
 	}
@@ -844,7 +839,6 @@ func (sys *ActorSystem) ServeHealthCheck(addr string) {
 	}()
 }
 
-// Add new method to list actors in the actor system.
 func (sys *ActorSystem) ListActors() []map[string]any {
 	var actors []map[string]any
 	sys.registry.Range(func(key, value any) bool {
@@ -852,7 +846,6 @@ func (sys *ActorSystem) ListActors() []map[string]any {
 		actors = append(actors, map[string]any{
 			"pid":         cell.ref.pid,
 			"mailboxType": cell.props.MailboxType,
-			// Additional metrics can be added here.
 		})
 		return true
 	})
@@ -1042,19 +1035,15 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 }
 
 func main() {
-
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
 	flag.Parse()
-
 	initLogger()
-
 	defer logger.Sync()
 	startedAt := time.Now()
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		logger.Fatal("Failed to load config", zap.Error(err))
 	}
-	// Start config reloading every 30 seconds.
 	watchConfig(*configPath, &cfg, 30*time.Second)
 	ctx := context.WithValue(context.Background(), startTimeKey, startedAt)
 	startDeadLetterProcessor()
@@ -1066,7 +1055,6 @@ func main() {
 		RateLimitingInterceptor(cfg.RateLimitPerSecond),
 		MetricsInterceptor,
 	}
-
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -1076,8 +1064,6 @@ func main() {
 			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		},
 	})
-
-	// Add middleware to extract correlation id from the header.
 	app.Use(func(c *fiber.Ctx) error {
 		if corrID := c.Get("X-Correlation-ID"); corrID != "" {
 			c.Locals("correlation_id", corrID)
@@ -1085,8 +1071,6 @@ func main() {
 		return c.Next()
 	})
 	app.Use(recoverMw.New())
-
-	// Added admin authentication middleware.
 	adminMiddleware := func(c *fiber.Ctx) error {
 		token := c.Get("X-Admin-Token")
 		if token == "" || token != cfg.AdminToken {
@@ -1094,17 +1078,10 @@ func main() {
 		}
 		return c.Next()
 	}
-
-	// Apply admin middleware to the /admin route group.
 	admin := app.Group("/admin", adminMiddleware)
-
-	// --- Admin UI and API endpoints ---
 	admin.Get("/ui", func(c *fiber.Ctx) error {
-		// Serve the static HTML file for the admin UI.
 		return c.Type("html").SendFile("/Users/sujit/Sites/go-app/admin.html")
 	})
-
-	// API: List actors
 	admin.Get("/api/actors", func(c *fiber.Ctx) error {
 		actors := system.ListActors()
 		return c.JSON(actors)
@@ -1117,7 +1094,6 @@ func main() {
 		}
 		return c.JSON(map[string]any{"actor": actorID, "events": events})
 	})
-	// API: Stop an actor by its id
 	admin.Post("/api/actors/:id/stop", func(c *fiber.Ctx) error {
 		actorID := c.Params("id")
 		if err := system.Stop(actorID); err != nil {
@@ -1125,8 +1101,6 @@ func main() {
 		}
 		return c.JSON(map[string]any{"message": "Actor " + actorID + " stopped"})
 	})
-	// Optionally more actor operations (restart, etc.) can be added here.
-
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
@@ -1157,7 +1131,6 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).SendString("Invalid or missing 'data' field")
 		}
 		reqID := fmt.Sprintf("%d", time.Now().UnixNano())
-
 		corrID := c.Get("X-Correlation-ID", "")
 		replyChan := make(chan ResponseMessage, 1)
 		reqMsg := RequestMessage{
@@ -1191,7 +1164,6 @@ func main() {
 			"start_time":    system.ctx.Value(startTimeKey),
 		})
 	})
-
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -1216,7 +1188,6 @@ func main() {
 	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
-
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	structuredLog("shutdown", "Memory stats", map[string]any{
@@ -1227,7 +1198,6 @@ func main() {
 	})
 	<-shutdownCtx.Done()
 	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": "context cancellation"})
-	// Trigger a graceful shutdown for Fiber and the actor system.
 	shutdownCtxTimeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := app.ShutdownWithContext(shutdownCtxTimeout); err != nil {
