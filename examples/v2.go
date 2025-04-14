@@ -908,6 +908,7 @@ type RequestMessage struct {
 	Payload       string
 	Reply         chan ResponseMessage
 	CorrelationID string
+	FiberCtx      *fiber.Ctx // New field
 }
 
 type RequestHandlerActor struct{}
@@ -1036,7 +1037,7 @@ func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
 
 type RequestWrapperActor struct {
 	id      string
-	handler func(payload string) (string, error)
+	handler fiber.Handler // Changed type
 }
 
 func (a *RequestWrapperActor) PreStart(ctx ActorContext) {
@@ -1047,12 +1048,19 @@ func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
 	switch req := msg.(type) {
 	case RequestMessage:
 		structuredLog("actor", "RequestWrapperActor processing", map[string]any{"actor": a.id, "payload": req.Payload})
-		res, err := a.handler(req.Payload)
-		if req.Reply != nil {
-			req.Reply <- ResponseMessage{Data: res, Err: err}
+		if req.FiberCtx != nil {
+			// Call the fiber.Handler with the provided *fiber.Ctx.
+			err := a.handler(req.FiberCtx)
+			if req.Reply != nil {
+				if err != nil {
+					req.Reply <- ResponseMessage{Data: nil, Err: err}
+				} else {
+					req.Reply <- ResponseMessage{Data: "processed via fiber.Handler", Err: nil}
+				}
+			}
+		} else {
+			// Legacy handling code can go here if needed.
 		}
-	default:
-		structuredLog("actor", "RequestWrapperActor unknown message", map[string]any{"actor": a.id, "message": msg})
 	}
 }
 
@@ -1160,27 +1168,18 @@ func main() {
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
 	app.Post("/process", func(c *fiber.Ctx) error {
-		var payload map[string]any
-		if err := c.BodyParser(&payload); err != nil {
-			return c.Status(fiber.StatusBadRequest).SendString(err.Error())
-		}
-		data, ok := payload["data"].(string)
-		if !ok || data == "" {
-			return c.Status(fiber.StatusBadRequest).SendString("Invalid or missing 'data' field")
-		}
 		reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
 		corrID := c.Get("X-Correlation-ID", "")
 		replyChan := make(chan ResponseMessage, 1)
 		reqMsg := RequestMessage{
 			ID:            reqID,
-			Payload:       data,
 			Reply:         replyChan,
 			CorrelationID: corrID,
+			FiberCtx:      c,
 		}
-		handler := func(payload string) (string, error) {
-			structuredLog("handler", "Processing request payload", map[string]any{"actor": reqID, "payload": payload})
-			time.Sleep(100 * time.Millisecond)
-			return fmt.Sprintf("Processed request %s with payload: %s", reqID, payload), nil
+		handler := func(c *fiber.Ctx) error {
+			structuredLog("handler", "Processing fiber request", map[string]any{"actor": reqID})
+			return nil
 		}
 		requestActor := &RequestWrapperActor{
 			id:      reqID,
