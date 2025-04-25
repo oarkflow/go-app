@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -21,14 +22,26 @@ const (
 	b         = 0.75
 )
 
-// Document represents a document in the store.
 type Document struct {
 	Key       string
-	Value     []byte
+	Value     interface{}
 	Timestamp int64
 }
 
-// BloomFilter implementation remains unchanged.
+func documentValueToString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 type BloomFilter struct {
 	size uint
 	bits []bool
@@ -62,7 +75,6 @@ func (bf *BloomFilter) Test(item string) bool {
 	return bf.bits[bf.hash(item, 0xA3B1)] && bf.bits[bf.hash(item, 0xF1C2)]
 }
 
-// KVStore is the key/value store including an in–memory inverted index.
 type KVStore struct {
 	dir             string
 	memtable        map[string]Document
@@ -77,12 +89,10 @@ type KVStore struct {
 	bloom           *BloomFilter
 	writeCounter    int64
 	writeCounterMux sync.Mutex
-	// invertedIndex maps a token -> document key -> slice of positions (for phrase queries)
-	invertedIndex map[string]map[string][]int
-	indexLock     sync.RWMutex
+	invertedIndex   map[string]map[string][]int
+	indexLock       sync.RWMutex
 }
 
-// NewKVStore initializes the store and its resources.
 func NewKVStore(dir string) (*KVStore, error) {
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {
@@ -118,7 +128,6 @@ func NewKVStore(dir string) (*KVStore, error) {
 	return store, nil
 }
 
-// Close shuts down the store.
 func (kv *KVStore) Close() error {
 	close(kv.stopCompaction)
 	kv.compactionWG.Wait()
@@ -131,7 +140,6 @@ func (kv *KVStore) Close() error {
 	return nil
 }
 
-// loadWAL replays the write ahead log.
 func (kv *KVStore) loadWAL() {
 	kv.walLock.Lock()
 	defer kv.walLock.Unlock()
@@ -198,20 +206,16 @@ func (kv *KVStore) writeValueLog(doc Document) error {
 	return nil
 }
 
-// tokenize splits text into lowercase tokens.
 func tokenize(text string) []string {
-	// A basic white space tokenizer. Adjust if needed.
 	parts := strings.Fields(strings.ToLower(text))
 	return parts
 }
 
-// indexDocument builds (or updates) the inverted index for a document.
 func (kv *KVStore) indexDocument(doc Document) {
-	text := string(doc.Value)
+	text := documentValueToString(doc.Value)
 	tokens := tokenize(text)
 	kv.indexLock.Lock()
 	defer kv.indexLock.Unlock()
-	// For each token, record the document key and the token’s positions.
 	for pos, token := range tokens {
 		if kv.invertedIndex[token] == nil {
 			kv.invertedIndex[token] = make(map[string][]int)
@@ -220,7 +224,6 @@ func (kv *KVStore) indexDocument(doc Document) {
 	}
 }
 
-// removeFromIndex removes a document from the inverted index.
 func (kv *KVStore) removeFromIndex(doc Document) {
 	kv.indexLock.Lock()
 	defer kv.indexLock.Unlock()
@@ -231,8 +234,7 @@ func (kv *KVStore) removeFromIndex(doc Document) {
 	}
 }
 
-// AddDocument adds a document and updates the index.
-func (kv *KVStore) AddDocument(key string, value []byte) error {
+func (kv *KVStore) AddDocument(key string, value interface{}) error {
 	doc := Document{
 		Key:       key,
 		Value:     value,
@@ -252,8 +254,7 @@ func (kv *KVStore) AddDocument(key string, value []byte) error {
 	return nil
 }
 
-func (kv *KVStore) UpdateDocument(key string, value []byte) error {
-	// Remove old indexing if document exists.
+func (kv *KVStore) UpdateDocument(key string, value interface{}) error {
 	kv.memtableLock.RLock()
 	oldDoc, exists := kv.memtable[key]
 	kv.memtableLock.RUnlock()
@@ -284,7 +285,6 @@ func (kv *KVStore) DeleteDocument(key string) error {
 	return nil
 }
 
-// AddDocuments adds a batch of documents.
 func (kv *KVStore) AddDocuments(docs []Document) error {
 	kv.walLock.Lock()
 	defer kv.walLock.Unlock()
@@ -309,7 +309,6 @@ func (kv *KVStore) AddDocuments(docs []Document) error {
 	return kv.walFile.Sync()
 }
 
-// FuzzySearch returns documents that match the query loosely.
 func (kv *KVStore) FuzzySearch(query string) []Document {
 	kv.memtableLock.RLock()
 	defer kv.memtableLock.RUnlock()
@@ -319,9 +318,8 @@ func (kv *KVStore) FuzzySearch(query string) []Document {
 		if !kv.bloom.Test(key) {
 			continue
 		}
-		// Check both key and content.
-		if strings.Contains(strings.ToLower(key), lQuery) ||
-			strings.Contains(strings.ToLower(string(doc.Value)), lQuery) {
+		text := documentValueToString(doc.Value)
+		if strings.Contains(strings.ToLower(key), lQuery) || strings.Contains(strings.ToLower(text), lQuery) {
 			results = append(results, doc)
 		}
 	}
@@ -331,7 +329,6 @@ func (kv *KVStore) FuzzySearch(query string) []Document {
 	return results
 }
 
-// Paginate returns a subset of documents for pagination.
 func (kv *KVStore) Paginate(docs []Document, page, pageSize int) []Document {
 	start := page * pageSize
 	if start >= len(docs) {
@@ -344,14 +341,13 @@ func (kv *KVStore) Paginate(docs []Document, page, pageSize int) []Document {
 	return docs[start:end]
 }
 
-// BM25Score returns a score for a document given a query (basic implementation).
 func BM25Score(doc Document, query string) float64 {
-	freq := float64(strings.Count(strings.ToLower(string(doc.Value)), strings.ToLower(query)))
+	text := documentValueToString(doc.Value)
+	freq := float64(strings.Count(strings.ToLower(text), strings.ToLower(query)))
 	score := (freq * (k1 + 1)) / (freq + k1)
 	return score
 }
 
-// QueryDocuments supports prefix and fuzzy queries.
 func (kv *KVStore) QueryDocuments(query string, queryType string) []Document {
 	if queryType == "prefix" {
 		kv.memtableLock.RLock()
@@ -372,7 +368,6 @@ func (kv *KVStore) QueryDocuments(query string, queryType string) []Document {
 	return nil
 }
 
-// compactionLoop periodically writes the memtable to a segment file.
 func (kv *KVStore) compactionLoop() {
 	defer kv.compactionWG.Done()
 	interval := 10 * time.Second
@@ -430,7 +425,6 @@ func (kv *KVStore) compactMemtable() {
 	f.Close()
 }
 
-// mmapFile memory–maps a file for reading.
 func mmapFile(filename string) ([]byte, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -451,11 +445,10 @@ func mmapFile(filename string) ([]byte, error) {
 	return b, nil
 }
 
-/////////////////////////
-// ElasticSearch–like Query Functions
-/////////////////////////
+//////////////////////////////
 
-// TermQuery returns documents containing the exact term.
+//////////////////////////////
+
 func (kv *KVStore) TermQuery(term string) []Document {
 	term = strings.ToLower(term)
 	kv.indexLock.RLock()
@@ -464,7 +457,6 @@ func (kv *KVStore) TermQuery(term string) []Document {
 	if !exists {
 		return nil
 	}
-
 	kv.memtableLock.RLock()
 	defer kv.memtableLock.RUnlock()
 	var results []Document
@@ -479,37 +471,29 @@ func (kv *KVStore) TermQuery(term string) []Document {
 	return results
 }
 
-// PhraseQuery returns documents that contain the entire phrase (consecutive tokens).
 func (kv *KVStore) PhraseQuery(phrase string) []Document {
-	// Tokenize the phrase.
 	tokens := tokenize(phrase)
 	if len(tokens) == 0 {
 		return nil
 	}
-
-	// Get candidate documents from the first token.
 	kv.indexLock.RLock()
 	candidateDocs, exists := kv.invertedIndex[tokens[0]]
 	kv.indexLock.RUnlock()
 	if !exists {
 		return nil
 	}
-
 	var results []Document
 	kv.memtableLock.RLock()
 	defer kv.memtableLock.RUnlock()
-	// Iterate over each candidate document.
 	for docKey, positions := range candidateDocs {
 		doc, ok := kv.memtable[docKey]
 		if !ok {
 			continue
 		}
-		text := string(doc.Value)
+		text := documentValueToString(doc.Value)
 		docTokens := tokenize(text)
-		// Check for the phrase in the document tokens.
 		found := false
 		for _, pos := range positions {
-			// Ensure room for the whole phrase.
 			if pos+len(tokens) > len(docTokens) {
 				continue
 			}
@@ -535,12 +519,7 @@ func (kv *KVStore) PhraseQuery(phrase string) []Document {
 	return results
 }
 
-// BooleanQuery performs a boolean combination of term queries.
-// must: list of terms that must be present.
-// should: list of terms that should be present (at least one).
-// mustNot: list of terms that must not be present.
 func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
-	// A helper to get a set of matching document keys for a term.
 	getDocsForTerm := func(term string) map[string]struct{} {
 		res := make(map[string]struct{})
 		results := kv.TermQuery(term)
@@ -550,17 +529,15 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 		return res
 	}
 
-	var candidate = make(map[string]struct{})
+	candidate := make(map[string]struct{})
 	initialized := false
 
-	// Process MUST clauses.
 	for _, term := range must {
 		docSet := getDocsForTerm(term)
 		if !initialized {
 			candidate = docSet
 			initialized = true
 		} else {
-			// Intersect
 			for key := range candidate {
 				if _, ok := docSet[key]; !ok {
 					delete(candidate, key)
@@ -569,7 +546,6 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 		}
 	}
 
-	// If no MUST clauses, initialize candidate with all memtable documents.
 	if !initialized {
 		kv.memtableLock.RLock()
 		for key := range kv.memtable {
@@ -578,7 +554,6 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 		kv.memtableLock.RUnlock()
 	}
 
-	// Process SHOULD clauses: if present, candidate must have at least one.
 	if len(should) > 0 {
 		shouldCandidate := make(map[string]struct{})
 		for _, term := range should {
@@ -586,7 +561,6 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 				shouldCandidate[key] = struct{}{}
 			}
 		}
-		// Intersect candidate with shouldCandidate.
 		for key := range candidate {
 			if _, ok := shouldCandidate[key]; !ok {
 				delete(candidate, key)
@@ -594,14 +568,12 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 		}
 	}
 
-	// Process MUST NOT clauses.
 	for _, term := range mustNot {
 		for key := range getDocsForTerm(term) {
 			delete(candidate, key)
 		}
 	}
 
-	// Retrieve final documents.
 	var results []Document
 	kv.memtableLock.RLock()
 	for key := range candidate {
@@ -616,7 +588,6 @@ func (kv *KVStore) BooleanQuery(must, should, mustNot []string) []Document {
 	return results
 }
 
-// RegexQuery returns documents whose text matches the given regular expression.
 func (kv *KVStore) RegexQuery(pattern string) []Document {
 	r, err := regexp.Compile(pattern)
 	if err != nil {
@@ -627,7 +598,8 @@ func (kv *KVStore) RegexQuery(pattern string) []Document {
 	defer kv.memtableLock.RUnlock()
 	var results []Document
 	for _, doc := range kv.memtable {
-		if r.MatchString(string(doc.Value)) {
+		text := documentValueToString(doc.Value)
+		if r.MatchString(text) {
 			results = append(results, doc)
 		}
 	}
@@ -637,81 +609,108 @@ func (kv *KVStore) RegexQuery(pattern string) []Document {
 	return results
 }
 
-// //////////////////
-// main() Demo
-// //////////////////
+//////////////////////////////
+
+//////////////////////////////
+
+func (kv *KVStore) LoadFromJSONFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var docs []Document
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&docs); err != nil {
+		return err
+	}
+
+	for _, doc := range docs {
+		kv.memtableLock.Lock()
+		kv.memtable[doc.Key] = doc
+		kv.memtableLock.Unlock()
+		kv.bloom.Add(doc.Key)
+		kv.indexDocument(doc)
+	}
+	return nil
+}
+
 func main() {
+	gob.Register(map[string]interface{}{})
 	store, err := NewKVStore("data")
 	if err != nil {
 		fmt.Println("Error initializing KVStore:", err)
 		return
 	}
 	defer store.Close()
-	// Add some documents.
-	if err := store.AddDocument("doc1", []byte("Hello, world! ElasticSearch provides rich query capabilities.")); err != nil {
+	err = store.LoadFromJSONFile("records.json")
+	if err != nil {
+		fmt.Println("Error loading from JSON file:", err)
+	}
+	if err := store.AddDocument("doc1", "Hello, world! ElasticSearch provides rich query capabilities."); err != nil {
 		fmt.Println("Error adding document:", err)
 	}
 	if err := store.AddDocument("doc2", []byte("Goodbye, world! Searching with regex and boolean queries.")); err != nil {
 		fmt.Println("Error adding document:", err)
 	}
-	if err := store.AddDocument("prefix_doc3", []byte("Fuzzy search example. The quick brown fox jumps over the lazy dog.")); err != nil {
+	sampleMap := map[string]interface{}{
+		"name":    "example",
+		"content": "This is a map-based document.",
+	}
+	if err := store.AddDocument("doc3", sampleMap); err != nil {
 		fmt.Println("Error adding document:", err)
 	}
-
+	type CustomData struct {
+		Title   string
+		Message string
+	}
+	custom := CustomData{Title: "Greetings", Message: "This is a struct-based document."}
+	if err := store.AddDocument("doc4", custom); err != nil {
+		fmt.Println("Error adding document:", err)
+	}
 	batch := []Document{
-		{Key: "doc4", Value: []byte("Batch document one with term search support.")},
-		{Key: "doc5", Value: []byte("Batch document two: phrase query, boolean query, and regex query.")},
+		{Key: "doc5", Value: "Batch document one with term search support."},
+		{Key: "doc6", Value: "Batch document two: phrase query, boolean query, and regex query."},
 	}
 	if err := store.AddDocuments(batch); err != nil {
 		fmt.Println("Error in batch add:", err)
 	}
-
-	// Demonstrate Fuzzy Search.
-	results := store.FuzzySearch("example")
+	results := store.FuzzySearch("document")
 	fmt.Println("Fuzzy Search Results:")
 	for _, d := range results {
-		score := BM25Score(d, "example")
-		fmt.Printf("Key: %s, Score: %f, Value: %s\n", d.Key, score, string(d.Value))
+		score := BM25Score(d, "document")
+		fmt.Printf("Key: %s, Score: %f, Value: %s\n", d.Key, score, documentValueToString(d.Value))
 	}
 	paged := store.Paginate(results, 0, 2)
 	fmt.Println("Paginated Results:")
 	for _, d := range paged {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
-
-	// Demonstrate TermQuery.
 	termResults := store.TermQuery("regex")
 	fmt.Println("\nTermQuery Results (term: \"regex\"):")
 	for _, d := range termResults {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
-
-	// Demonstrate PhraseQuery.
-	phraseResults := store.PhraseQuery("quick brown fox")
-	fmt.Println("\nPhraseQuery Results (phrase: \"quick brown fox\"):")
+	phraseResults := store.PhraseQuery("goodbye world")
+	fmt.Println("\nPhraseQuery Results (phrase: \"goodbye world\"):")
 	for _, d := range phraseResults {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
-
-	// Demonstrate BooleanQuery.
 	booleanResults := store.BooleanQuery(
-		[]string{"document"},        // must have "document"
-		[]string{"phrase", "regex"}, // should have either "phrase" or "regex"
-		[]string{"goodbye"},         // must not have "goodbye"
+		[]string{"document"},
+		[]string{"phrase", "regex"},
+		[]string{"map-based"},
 	)
-	fmt.Println("\nBooleanQuery Results (must: [\"document\"], should: [\"phrase\", \"regex\"], mustNot: [\"goodbye\"]):")
+	fmt.Println("\nBooleanQuery Results (must: [\"document\"], should: [\"phrase\", \"regex\"], mustNot: [\"map-based\"]):")
 	for _, d := range booleanResults {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
-
-	// Demonstrate RegexQuery.
 	regexResults := store.RegexQuery(`(?i)elasticsearch`)
 	fmt.Println("\nRegexQuery Results (pattern: \"(?i)elasticsearch\"):")
 	for _, d := range regexResults {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
-
-	// Memory map a segment file for demonstration.
 	segmentFiles, _ := filepath.Glob(filepath.Join("data", "segment_*.dat"))
 	if len(segmentFiles) > 0 {
 		mapped, err := mmapFile(segmentFiles[0])
@@ -721,11 +720,9 @@ func main() {
 			fmt.Println("Error memory-mapping file:", err)
 		}
 	}
-
-	// Existing QueryDocuments (prefix) demonstration.
 	prefixResults := store.QueryDocuments("doc", "prefix")
 	fmt.Println("\nQueryDocuments (prefix) Results:")
 	for _, d := range prefixResults {
-		fmt.Printf("Key: %s, Value: %s\n", d.Key, string(d.Value))
+		fmt.Printf("Key: %s, Value: %s\n", d.Key, documentValueToString(d.Value))
 	}
 }
