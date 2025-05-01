@@ -135,15 +135,15 @@ var respChanPool = sync.Pool{
 }
 
 type Actor interface {
-	PreStart(ctx ActorContext)
-	Receive(ctx ActorContext, message Message)
-	PostStop(ctx ActorContext)
-	PreRestart(ctx ActorContext, reason error)
-	AfterRestart(ctx ActorContext)   // New hook after restart
-	BeforeShutdown(ctx ActorContext) // New hook before shutdown
+	PreStart(ctx *ActorContext)
+	Receive(ctx *ActorContext, message Message)
+	PostStop(ctx *ActorContext)
+	PreRestart(ctx *ActorContext, reason error)
+	AfterRestart(ctx *ActorContext)   // New hook after restart
+	BeforeShutdown(ctx *ActorContext) // New hook before shutdown
 }
 
-type Behavior func(ctx ActorContext, msg Message)
+type Behavior func(ctx *ActorContext, msg Message)
 
 type BaseActor struct {
 	mu            sync.Mutex
@@ -169,7 +169,7 @@ func (b *BaseActor) Unbecome() {
 	b.mu.Unlock()
 }
 
-func (b *BaseActor) DefaultReceive(ctx ActorContext, msg Message) {
+func (b *BaseActor) DefaultReceive(ctx *ActorContext, msg Message) {
 	b.mu.Lock()
 	beh := b.behavior
 	b.mu.Unlock()
@@ -178,8 +178,8 @@ func (b *BaseActor) DefaultReceive(ctx ActorContext, msg Message) {
 	}
 }
 
-func (b *BaseActor) AfterRestart(ctx ActorContext)   { /* no-op default */ }
-func (b *BaseActor) BeforeShutdown(ctx ActorContext) { /* no-op default */ }
+func (b *BaseActor) AfterRestart(ctx *ActorContext)   { /* no-op default */ }
+func (b *BaseActor) BeforeShutdown(ctx *ActorContext) { /* no-op default */ }
 
 type Persistence interface {
 	SaveSnapshot(actorID string, state any) error
@@ -264,9 +264,9 @@ func (ps *PubSub) Publish(topic string, msg Message) {
 
 var globalPubSub = NewPubSub()
 
-type MessageInterceptor func(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message)
+type MessageInterceptor func(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message)
 
-func ChainInterceptors(base func(ctx ActorContext, msg Message), interceptors ...MessageInterceptor) func(ctx ActorContext, msg Message) {
+func ChainInterceptors(base func(ctx *ActorContext, msg Message), interceptors ...MessageInterceptor) func(ctx *ActorContext, msg Message) {
 	chain := base
 	for i := len(interceptors) - 1; i >= 0; i-- {
 		chain = interceptors[i](chain)
@@ -291,8 +291,8 @@ func (m *DummyMetrics) Observe(metric string, value float64) {
 
 var metrics Metrics = &DummyMetrics{}
 
-func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
-	return func(ctx ActorContext, msg Message) {
+func LoggingInterceptor(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+	return func(ctx *ActorContext, msg Message) {
 		corrID := ""
 		if id := ctx.Context.Value("correlation_id"); id != nil {
 			corrID = fmt.Sprintf("%v", id)
@@ -315,8 +315,8 @@ func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx Actor
 
 func RateLimitingInterceptor(maxPerSec int) MessageInterceptor {
 	limiter := rate.NewLimiter(rate.Limit(maxPerSec), maxPerSec)
-	return func(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
-		return func(ctx ActorContext, msg Message) {
+	return func(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+		return func(ctx *ActorContext, msg Message) {
 			if !limiter.Allow() {
 				structuredLog("interceptor", "Rate limit exceeded", map[string]any{"actor": ctx.Self.pid, "message": msg})
 				metrics.Increment("messages.dropped")
@@ -327,8 +327,8 @@ func RateLimitingInterceptor(maxPerSec int) MessageInterceptor {
 	}
 }
 
-func MetricsInterceptor(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
-	return func(ctx ActorContext, msg Message) {
+func MetricsInterceptor(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+	return func(ctx *ActorContext, msg Message) {
 		startTime := time.Now()
 		next(ctx, msg)
 		duration := time.Since(startTime)
@@ -564,7 +564,7 @@ type actorCell struct {
 	parent      *actorCell
 	children    sync.Map
 	supervisor  SupervisionStrategy
-	interceptor func(ctx ActorContext, msg Message)
+	interceptor func(ctx *ActorContext, msg Message)
 	mu          sync.Mutex
 }
 
@@ -585,7 +585,7 @@ func (cell *actorCell) run() {
 		}()
 		actCtx, cancel := context.WithCancel(cell.ctx)
 		cell.cancel = cancel
-		actorContext := ActorContext{
+		actorContext := &ActorContext{
 			Self:       cell.ref,
 			Parent:     nil,
 			Context:    actCtx,
@@ -619,7 +619,7 @@ func (cell *actorCell) run() {
 }
 
 func (cell *actorCell) stop() {
-	actorCtx := ActorContext{
+	actorCtx := &ActorContext{
 		Self:       cell.ref,
 		Parent:     nil,
 		Context:    cell.ctx,
@@ -656,7 +656,7 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 	go func() {
 		time.Sleep(delay)
 		s.restarts.Store(actorID, count+1)
-		actorCtx := ActorContext{
+		actorCtx := &ActorContext{
 			Self:    child.ref,
 			Context: child.ctx,
 		}
@@ -802,7 +802,7 @@ func (sys *ActorSystem) Spawn(pid string, actor Actor, props ActorProps) *ActorR
 	ref := ActorRef{pid: pid, mailbox: mbox, system: sys}
 	cell := &actorCell{ref: ref, actor: actor, mailbox: mbox, props: props, ctx: actorCtx, supervisor: sys.supervisor}
 	if len(props.Interceptors) > 0 {
-		cell.interceptor = ChainInterceptors(func(ctx ActorContext, msg Message) {
+		cell.interceptor = ChainInterceptors(func(ctx *ActorContext, msg Message) {
 			switch env := msg.(type) {
 			case Envelope:
 				actor.Receive(ctx, env)
@@ -950,11 +950,11 @@ type RequestMessage struct {
 
 type RequestHandlerActor struct{}
 
-func (a *RequestHandlerActor) PreStart(ctx ActorContext) {
+func (a *RequestHandlerActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "RequestHandlerActor starting", nil)
 }
 
-func (a *RequestHandlerActor) Receive(ctx ActorContext, msg Message) {
+func (a *RequestHandlerActor) Receive(ctx *ActorContext, msg Message) {
 	switch req := msg.(type) {
 	case RequestMessage:
 		response := fmt.Sprintf("Processed request %s with payload: %s", req.ID, req.Payload)
@@ -964,19 +964,19 @@ func (a *RequestHandlerActor) Receive(ctx ActorContext, msg Message) {
 	}
 }
 
-func (a *RequestHandlerActor) PostStop(ctx ActorContext) {
+func (a *RequestHandlerActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "RequestHandlerActor stopping", nil)
 }
 
-func (a *RequestHandlerActor) PreRestart(ctx ActorContext, reason error) {
+func (a *RequestHandlerActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "RequestHandlerActor restarting", map[string]any{"reason": reason.Error()})
 }
 
-func (a *RequestHandlerActor) AfterRestart(ctx ActorContext) {
+func (a *RequestHandlerActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "RequestHandlerActor after restart", nil)
 }
 
-func (a *RequestHandlerActor) BeforeShutdown(ctx ActorContext) {
+func (a *RequestHandlerActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "RequestHandlerActor before shutdown", nil)
 }
 
@@ -985,9 +985,9 @@ type EchoActor struct {
 	BaseActor
 }
 
-func (a *EchoActor) PreStart(ctx ActorContext) {
+func (a *EchoActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor starting", map[string]any{"actor": a.name})
-	a.Become(func(ctx ActorContext, msg Message) {
+	a.Become(func(ctx *ActorContext, msg Message) {
 		switch env := msg.(type) {
 		case Envelope:
 			structuredLog("actor", "EchoActor received envelope", map[string]any{"actor": a.name, "message": env.Message})
@@ -1001,23 +1001,23 @@ func (a *EchoActor) PreStart(ctx ActorContext) {
 	})
 }
 
-func (a *EchoActor) Receive(ctx ActorContext, msg Message) {
+func (a *EchoActor) Receive(ctx *ActorContext, msg Message) {
 	a.DefaultReceive(ctx, msg)
 }
 
-func (a *EchoActor) PostStop(ctx ActorContext) {
+func (a *EchoActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *EchoActor) PreRestart(ctx ActorContext, reason error) {
+func (a *EchoActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "EchoActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
-func (a *EchoActor) AfterRestart(ctx ActorContext) {
+func (a *EchoActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor after restart", map[string]any{"actor": a.name})
 }
 
-func (a *EchoActor) BeforeShutdown(ctx ActorContext) {
+func (a *EchoActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor before shutdown", map[string]any{"actor": a.name})
 }
 
@@ -1025,7 +1025,7 @@ type TimerActor struct {
 	name string
 }
 
-func (a *TimerActor) PreStart(ctx ActorContext) {
+func (a *TimerActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor starting", map[string]any{"actor": a.name})
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -1043,23 +1043,23 @@ func (a *TimerActor) PreStart(ctx ActorContext) {
 	}()
 }
 
-func (a *TimerActor) Receive(ctx ActorContext, msg Message) {
+func (a *TimerActor) Receive(ctx *ActorContext, msg Message) {
 	structuredLog("actor", "TimerActor received message", map[string]any{"actor": a.name, "message": msg})
 }
 
-func (a *TimerActor) PostStop(ctx ActorContext) {
+func (a *TimerActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *TimerActor) PreRestart(ctx ActorContext, reason error) {
+func (a *TimerActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "TimerActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
-func (a *TimerActor) AfterRestart(ctx ActorContext) {
+func (a *TimerActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor after restart", map[string]any{"actor": a.name})
 }
 
-func (a *TimerActor) BeforeShutdown(ctx ActorContext) {
+func (a *TimerActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor before shutdown", map[string]any{"actor": a.name})
 }
 
@@ -1069,14 +1069,14 @@ type PersistentActor struct {
 	BaseActor
 }
 
-func (a *PersistentActor) PreStart(ctx ActorContext) {
+func (a *PersistentActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor starting", map[string]any{"actor": a.name})
 	if restored, err := persistenceManager.RestoreSnapshot(a.name); err == nil {
 		a.state = restored.(map[string]any)
 	} else {
 		a.state = make(map[string]any)
 	}
-	a.Become(func(ctx ActorContext, msg Message) {
+	a.Become(func(ctx *ActorContext, msg Message) {
 		structuredLog("actor", "PersistentActor processing", map[string]any{"actor": a.name, "message": msg})
 		a.state["lastMessage"] = msg
 		_ = persistenceManager.SaveSnapshot(a.name, a.state)
@@ -1084,23 +1084,23 @@ func (a *PersistentActor) PreStart(ctx ActorContext) {
 	})
 }
 
-func (a *PersistentActor) Receive(ctx ActorContext, msg Message) {
+func (a *PersistentActor) Receive(ctx *ActorContext, msg Message) {
 	a.DefaultReceive(ctx, msg)
 }
 
-func (a *PersistentActor) PostStop(ctx ActorContext) {
+func (a *PersistentActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
+func (a *PersistentActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "PersistentActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
-func (a *PersistentActor) AfterRestart(ctx ActorContext) {
+func (a *PersistentActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor after restart", map[string]any{"actor": a.name})
 }
 
-func (a *PersistentActor) BeforeShutdown(ctx ActorContext) {
+func (a *PersistentActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor before shutdown", map[string]any{"actor": a.name})
 }
 
@@ -1109,11 +1109,11 @@ type RequestWrapperActor struct {
 	handler fiber.Handler
 }
 
-func (a *RequestWrapperActor) PreStart(ctx ActorContext) {
+func (a *RequestWrapperActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "RequestWrapperActor starting", map[string]any{"actor": a.id})
 }
 
-func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
+func (a *RequestWrapperActor) Receive(ctx *ActorContext, msg Message) {
 	switch req := msg.(type) {
 	case RequestMessage:
 		structuredLog("actor", "RequestWrapperActor processing", map[string]any{"actor": a.id, "payload": req.Payload})
@@ -1133,19 +1133,19 @@ func (a *RequestWrapperActor) Receive(ctx ActorContext, msg Message) {
 	}
 }
 
-func (a *RequestWrapperActor) PostStop(ctx ActorContext) {
+func (a *RequestWrapperActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "RequestWrapperActor stopping", map[string]any{"actor": a.id})
 }
 
-func (a *RequestWrapperActor) PreRestart(ctx ActorContext, reason error) {
+func (a *RequestWrapperActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "RequestWrapperActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
 }
 
-func (a *RequestWrapperActor) AfterRestart(ctx ActorContext) {
+func (a *RequestWrapperActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "RequestWrapperActor after restart", map[string]any{"actor": a.id})
 }
 
-func (a *RequestWrapperActor) BeforeShutdown(ctx ActorContext) {
+func (a *RequestWrapperActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "RequestWrapperActor before shutdown", map[string]any{"actor": a.id})
 }
 
@@ -1153,11 +1153,11 @@ type RemoteActor struct {
 	id string
 }
 
-func (a *RemoteActor) PreStart(ctx ActorContext) {
+func (a *RemoteActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "RemoteActor starting", map[string]any{"actor": a.id})
 }
 
-func (a *RemoteActor) Receive(ctx ActorContext, msg Message) {
+func (a *RemoteActor) Receive(ctx *ActorContext, msg Message) {
 	err := ctx.Self.system.remoteTransport.SendRemote(ctx.Self.pid, msg)
 	if err != nil {
 		structuredLog("remoteActor", "Remote sending failed", map[string]any{"actor": a.id, "error": err.Error()})
@@ -1167,19 +1167,19 @@ func (a *RemoteActor) Receive(ctx ActorContext, msg Message) {
 	}
 }
 
-func (a *RemoteActor) PostStop(ctx ActorContext) {
+func (a *RemoteActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "RemoteActor stopping", map[string]any{"actor": a.id})
 }
 
-func (a *RemoteActor) PreRestart(ctx ActorContext, reason error) {
+func (a *RemoteActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "RemoteActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
 }
 
-func (a *RemoteActor) AfterRestart(ctx ActorContext) {
+func (a *RemoteActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "RemoteActor after restart", map[string]any{"actor": a.id})
 }
 
-func (a *RemoteActor) BeforeShutdown(ctx ActorContext) {
+func (a *RemoteActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "RemoteActor before shutdown", map[string]any{"actor": a.id})
 }
 
@@ -1187,11 +1187,11 @@ type CombinedActor struct {
 	children []*ActorRef
 }
 
-func (a *CombinedActor) PreStart(ctx ActorContext) {
+func (a *CombinedActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "CombinedActor starting", map[string]any{"actor": "CombinedActor"})
 }
 
-func (a *CombinedActor) Receive(ctx ActorContext, msg Message) {
+func (a *CombinedActor) Receive(ctx *ActorContext, msg Message) {
 	switch req := msg.(type) {
 	case Envelope:
 		var wg sync.WaitGroup
@@ -1229,19 +1229,19 @@ func (a *CombinedActor) Receive(ctx ActorContext, msg Message) {
 	}
 }
 
-func (a *CombinedActor) PostStop(ctx ActorContext) {
+func (a *CombinedActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "CombinedActor stopping", map[string]any{"actor": "CombinedActor"})
 }
 
-func (a *CombinedActor) PreRestart(ctx ActorContext, reason error) {
+func (a *CombinedActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "CombinedActor restarting", map[string]any{"actor": "CombinedActor", "reason": reason.Error()})
 }
 
-func (a *CombinedActor) AfterRestart(ctx ActorContext) {
+func (a *CombinedActor) AfterRestart(ctx *ActorContext) {
 	structuredLog("actor", "CombinedActor after restart", map[string]any{"actor": "CombinedActor"})
 }
 
-func (a *CombinedActor) BeforeShutdown(ctx ActorContext) {
+func (a *CombinedActor) BeforeShutdown(ctx *ActorContext) {
 	structuredLog("actor", "CombinedActor before shutdown", map[string]any{"actor": "CombinedActor"})
 }
 
