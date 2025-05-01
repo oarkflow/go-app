@@ -1,29 +1,55 @@
-// main.go
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"gopkg.in/yaml.v3" // go get gopkg.in/yaml.v2
+	recoverMw "github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/vmihailenco/msgpack/v5"
+	"go.uber.org/zap"
+	"golang.org/x/time/rate"
+	"gopkg.in/yaml.v2"
 )
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 0. Configuration Management
-////////////////////////////////////////////////////////////////////////////////
+type contextKey string
 
-// Config holds runtime configuration parameters.
+const startTimeKey contextKey = "startTime"
+
+var logger *zap.Logger
+var actorRestartCount atomic.Int64
+
+func initLogger() {
+	var err error
+
+	logger, err = zap.NewProduction(zap.AddCaller())
+	if err != nil {
+		logger, err = zap.NewDevelopment(zap.AddCaller())
+		if err != nil {
+			log.Fatalf("Failed to initialize any logger: %v", err)
+		}
+	}
+	rand.Seed(time.Now().UnixNano())
+}
+
 type Config struct {
 	MailboxSize         int           `yaml:"mailbox_size"`
 	MaxRestarts         int           `yaml:"max_restarts"`
@@ -31,9 +57,18 @@ type Config struct {
 	RateLimitPerSecond  int           `yaml:"rate_limit_per_second"`
 	HealthCheckEndpoint string        `yaml:"health_check_endpoint"`
 	RemoteEndpoint      string        `yaml:"remote_endpoint"`
+	HTTPPort            string        `yaml:"http_port"`
+	AdminToken          string        `yaml:"admin_token"`
 }
 
-// LoadConfig loads configuration from a YAML file.
+func (cfg *Config) Validate() error {
+	if cfg.HTTPPort == "" {
+		return errors.New("HTTPPort must not be empty")
+	}
+
+	return nil
+}
+
 func LoadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -43,18 +78,17 @@ func LoadConfig(filename string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-	// Set defaults if not provided.
 	if cfg.MailboxSize == 0 {
-		cfg.MailboxSize = 10
+		cfg.MailboxSize = 1024
 	}
 	if cfg.MaxRestarts == 0 {
 		cfg.MaxRestarts = 5
 	}
 	if cfg.BackoffBase == 0 {
-		cfg.BackoffBase = 1 * time.Second
+		cfg.BackoffBase = 1 * time.Millisecond
 	}
 	if cfg.RateLimitPerSecond == 0 {
-		cfg.RateLimitPerSecond = 10
+		cfg.RateLimitPerSecond = 1000000
 	}
 	if cfg.HealthCheckEndpoint == "" {
 		cfg.HealthCheckEndpoint = ":9090"
@@ -62,31 +96,55 @@ func LoadConfig(filename string) (*Config, error) {
 	if cfg.RemoteEndpoint == "" {
 		cfg.RemoteEndpoint = "http://localhost:8080/remote"
 	}
+	if cfg.HTTPPort == "" {
+		cfg.HTTPPort = ":3000"
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 1. Actor Interface, Dynamic Behavior & BaseActor
-////////////////////////////////////////////////////////////////////////////////
+func watchConfig(filename string, currentCfg **Config, reloadInterval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(reloadInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			newCfg, err := LoadConfig(filename)
+			if err != nil {
+				structuredLog("config", "Config reload failed", map[string]any{"error": err.Error()})
+				continue
+			}
+			*currentCfg = newCfg
 
-type Message interface{}
+		}
+	}()
+}
 
+type Message any
 type ResponseMessage struct {
 	Data any
 	Err  error
 }
 
-type Actor interface {
-	PreStart(ctx ActorContext)
-	Receive(ctx ActorContext, message Message)
-	PostStop(ctx ActorContext)
-	PreRestart(ctx ActorContext, reason error)
+var envelopePool = sync.Pool{
+	New: func() any { return new(Envelope) },
+}
+var respChanPool = sync.Pool{
+	New: func() any { return make(chan ResponseMessage, 1) },
 }
 
-// Behavior is a function type that describes an actor’s message processing.
-type Behavior func(ctx ActorContext, msg Message)
+type Actor interface {
+	PreStart(ctx *ActorContext)
+	Receive(ctx *ActorContext, message Message)
+	PostStop(ctx *ActorContext)
+	PreRestart(ctx *ActorContext, reason error)
+	AfterRestart(ctx *ActorContext)   // New hook after restart
+	BeforeShutdown(ctx *ActorContext) // New hook before shutdown
+}
 
-// BaseActor provides a default implementation for dynamic behavior switching.
+type Behavior func(ctx *ActorContext, msg Message)
+
 type BaseActor struct {
 	mu            sync.Mutex
 	behavior      Behavior
@@ -95,25 +153,23 @@ type BaseActor struct {
 
 func (b *BaseActor) Become(newBehavior Behavior) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.behavior != nil {
 		b.behaviorStack = append(b.behaviorStack, b.behavior)
 	}
 	b.behavior = newBehavior
+	b.mu.Unlock()
 }
 
 func (b *BaseActor) Unbecome() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	n := len(b.behaviorStack)
-	if n == 0 {
-		return
+	if len(b.behaviorStack) > 0 {
+		b.behavior = b.behaviorStack[len(b.behaviorStack)-1]
+		b.behaviorStack = b.behaviorStack[:len(b.behaviorStack)-1]
 	}
-	b.behavior = b.behaviorStack[n-1]
-	b.behaviorStack = b.behaviorStack[:n-1]
+	b.mu.Unlock()
 }
 
-func (b *BaseActor) DefaultReceive(ctx ActorContext, msg Message) {
+func (b *BaseActor) DefaultReceive(ctx *ActorContext, msg Message) {
 	b.mu.Lock()
 	beh := b.behavior
 	b.mu.Unlock()
@@ -122,9 +178,8 @@ func (b *BaseActor) DefaultReceive(ctx ActorContext, msg Message) {
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 2. Persistence & Event Sourcing (Stubs for Production)
-////////////////////////////////////////////////////////////////////////////////
+func (b *BaseActor) AfterRestart(ctx *ActorContext)   { /* no-op default */ }
+func (b *BaseActor) BeforeShutdown(ctx *ActorContext) { /* no-op default */ }
 
 type Persistence interface {
 	SaveSnapshot(actorID string, state any) error
@@ -178,50 +233,40 @@ func (l *DummyEventLogger) GetEvents(actorID string) ([]any, error) {
 
 var eventLogger EventLogger = &DummyEventLogger{}
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 3. Pub/Sub Mechanism
-////////////////////////////////////////////////////////////////////////////////
-
 type PubSub struct {
 	mu          sync.RWMutex
 	subscribers map[string][]*ActorRef
 }
 
 func NewPubSub() *PubSub {
-	return &PubSub{
-		subscribers: make(map[string][]*ActorRef),
-	}
+	return &PubSub{subscribers: make(map[string][]*ActorRef)}
 }
 
 func (ps *PubSub) Subscribe(topic string, ref *ActorRef) {
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
 	ps.subscribers[topic] = append(ps.subscribers[topic], ref)
+	ps.mu.Unlock()
 }
 
 func (ps *PubSub) Publish(topic string, msg Message) {
 	ps.mu.RLock()
-	defer ps.mu.RUnlock()
 	refs, exists := ps.subscribers[topic]
+	ps.mu.RUnlock()
 	if !exists {
 		return
 	}
 	for _, ref := range refs {
 		if err := ref.Tell(msg); err != nil {
-			structuredLog("pubsub", "Message delivery failed", map[string]any{"actor": ref.pid, "error": err.Error()})
+			structuredLog("pubsub", "Delivery failed", map[string]any{"actor": ref.pid, "error": err.Error()})
 		}
 	}
 }
 
 var globalPubSub = NewPubSub()
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 4. Middleware / Interceptors & Metrics
-////////////////////////////////////////////////////////////////////////////////
+type MessageInterceptor func(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message)
 
-type MessageInterceptor func(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message)
-
-func ChainInterceptors(base func(ctx ActorContext, msg Message), interceptors ...MessageInterceptor) func(ctx ActorContext, msg Message) {
+func ChainInterceptors(base func(ctx *ActorContext, msg Message), interceptors ...MessageInterceptor) func(ctx *ActorContext, msg Message) {
 	chain := base
 	for i := len(interceptors) - 1; i >= 0; i-- {
 		chain = interceptors[i](chain)
@@ -246,57 +291,90 @@ func (m *DummyMetrics) Observe(metric string, value float64) {
 
 var metrics Metrics = &DummyMetrics{}
 
-// LoggingInterceptor provides structured logging for each message.
-func LoggingInterceptor(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
-	return func(ctx ActorContext, msg Message) {
-		structuredLog("interceptor", "Message processing", map[string]any{"actor": ctx.Self.pid, "message": msg})
+func LoggingInterceptor(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+	return func(ctx *ActorContext, msg Message) {
+		corrID := ""
+		if id := ctx.Context.Value("correlation_id"); id != nil {
+			corrID = fmt.Sprintf("%v", id)
+		}
+		var safeMsg any = msg
+		if req, ok := msg.(RequestMessage); ok {
+			safeMsg = map[string]any{
+				"ID":            req.ID,
+				"Payload":       req.Payload,
+				"CorrelationID": req.CorrelationID,
+			}
+		}
+		structuredLog("interceptor", "Processing message", map[string]any{
+			"actor": ctx.Self.pid, "message": safeMsg, "correlation_id": corrID,
+		})
 		metrics.Increment("messages.processed")
 		next(ctx, msg)
 	}
 }
 
-// RateLimitingInterceptor allows at most maxPerSec messages per actor per second.
 func RateLimitingInterceptor(maxPerSec int) MessageInterceptor {
-	var mu sync.Mutex
-	var count int
-	ticker := time.NewTicker(1 * time.Second)
-	go func() {
-		for range ticker.C {
-			mu.Lock()
-			count = 0
-			mu.Unlock()
-		}
-	}()
-	return func(next func(ctx ActorContext, msg Message)) func(ctx ActorContext, msg Message) {
-		return func(ctx ActorContext, msg Message) {
-			mu.Lock()
-			if count >= maxPerSec {
-				mu.Unlock()
+	limiter := rate.NewLimiter(rate.Limit(maxPerSec), maxPerSec)
+	return func(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+		return func(ctx *ActorContext, msg Message) {
+			if !limiter.Allow() {
 				structuredLog("interceptor", "Rate limit exceeded", map[string]any{"actor": ctx.Self.pid, "message": msg})
 				metrics.Increment("messages.dropped")
-				// Optionally push to a dead-letter queue here.
 				return
 			}
-			count++
-			mu.Unlock()
 			next(ctx, msg)
 		}
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 5. Structured Logging Helper
-////////////////////////////////////////////////////////////////////////////////
+func MetricsInterceptor(next func(ctx *ActorContext, msg Message)) func(ctx *ActorContext, msg Message) {
+	return func(ctx *ActorContext, msg Message) {
+		startTime := time.Now()
+		next(ctx, msg)
+		duration := time.Since(startTime)
+		metrics.Observe("actor.message.processing.duration_ms", float64(duration.Milliseconds()))
+	}
+}
 
-// structuredLog wraps standard logging with key/value context.
+var (
+	deadLetterQueue = make(chan Message, 10000)
+	deadLetterWg    sync.WaitGroup
+)
+
+func startDeadLetterProcessor() {
+	deadLetterWg.Add(1)
+	go func() {
+		defer deadLetterWg.Done()
+		for msg := range deadLetterQueue {
+			structuredLog("deadletter", "Processing dead-letter message", map[string]any{"message": msg})
+		}
+	}()
+}
+
+func stopDeadLetterProcessor() {
+	close(deadLetterQueue)
+	deadLetterWg.Wait()
+}
+
+func enqueueDeadLetter(msg Message) {
+	select {
+	case deadLetterQueue <- msg:
+	default:
+	}
+}
+
 func structuredLog(component, msg string, fields map[string]any) {
+	if logger != nil {
+		logger.Info(msg, zap.String("component", component), zap.Any("fields", fields))
+		return
+	}
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["timestamp"] = time.Now().Format(time.RFC3339)
 	entry, _ := json.Marshal(fields)
 	log.Printf("[%s] %s - %s", component, msg, string(entry))
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Section 6. Actor Addressing and Mailbox Implementations
-////////////////////////////////////////////////////////////////////////////////
 
 type ActorRef struct {
 	pid     string
@@ -307,24 +385,27 @@ type ActorRef struct {
 
 func (r *ActorRef) Tell(message Message) error {
 	if !r.running.Load() {
-		return errors.New("actor is not running")
+		return nil
 	}
 	err := r.mailbox.Enqueue(message)
 	if err != nil {
-		// Push to dead-letter queue (here we just log it)
-		structuredLog("deadletter", "Message dropped", map[string]any{"actor": r.pid, "message": message})
+		enqueueDeadLetter(map[string]any{"actor": r.pid, "message": message})
+		structuredLog("deadletter", "Dropped message", map[string]any{"actor": r.pid})
 	}
 	return err
 }
 
 func (r *ActorRef) Ask(message Message, timeout time.Duration) (ResponseMessage, error) {
-	replyChan := make(chan ResponseMessage, 1)
-	envelope := Envelope{
-		Message:   message,
-		ReplyChan: replyChan,
-	}
-	err := r.mailbox.Enqueue(envelope)
-	if err != nil {
+	replyChan := respChanPool.Get().(chan ResponseMessage)
+	defer func() {
+		// Drain replyChan before putting back into pool.
+		for len(replyChan) > 0 {
+			<-replyChan
+		}
+		respChanPool.Put(replyChan)
+	}()
+	envelope := Envelope{Message: message, ReplyChan: replyChan}
+	if err := r.mailbox.Enqueue(envelope); err != nil {
 		return ResponseMessage{}, err
 	}
 	select {
@@ -340,14 +421,12 @@ type Envelope struct {
 	ReplyChan chan ResponseMessage
 }
 
-// Mailbox abstracts a message queue.
 type Mailbox interface {
 	Enqueue(message Message) error
 	Dequeue() (Message, bool)
 	Close()
 }
 
-// StandardMailbox implements a buffered mailbox.
 type StandardMailbox struct {
 	ch chan Message
 }
@@ -357,16 +436,18 @@ func NewStandardMailbox(capacity int) *StandardMailbox {
 }
 
 func (m *StandardMailbox) Enqueue(message Message) error {
-	// Try multiple times before giving up.
-	for i := 0; i < 3; i++ {
+	maxRetries := 3
+	delay := 50 * time.Millisecond
+	for i := 0; i < maxRetries; i++ {
 		select {
 		case m.ch <- message:
 			return nil
 		default:
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(delay)
+			delay *= 2
 		}
 	}
-	return errors.New("mailbox full after retries, message dropped")
+	return errors.New("mailbox full after retries")
 }
 
 func (m *StandardMailbox) Dequeue() (Message, bool) {
@@ -378,7 +459,12 @@ func (m *StandardMailbox) Close() {
 	close(m.ch)
 }
 
-// PriorityMailbox uses a heap for prioritized messages.
+var priorityMessagePool = sync.Pool{
+	New: func() any {
+		return new(PriorityMessage)
+	},
+}
+
 type PriorityMessage struct {
 	priority int
 	message  Message
@@ -393,9 +479,7 @@ type PriorityMailbox struct {
 }
 
 func NewPriorityMailbox() *PriorityMailbox {
-	pm := &PriorityMailbox{
-		messages: make(priorityQueue, 0),
-	}
+	pm := &PriorityMailbox{messages: make(priorityQueue, 0)}
 	pm.cond = sync.NewCond(&pm.mu)
 	return pm
 }
@@ -406,14 +490,17 @@ func (pm *PriorityMailbox) Enqueue(message Message) error {
 		p = pe.Priority
 		message = pe.Envelope
 	} else {
-		p = 1000 // default low priority
+		p = 1000
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if pm.closed {
-		return errors.New("mailbox is closed")
+		return errors.New("mailbox closed")
 	}
-	heap.Push(&pm.messages, &PriorityMessage{priority: p, message: message})
+	pmsg := priorityMessagePool.Get().(*PriorityMessage)
+	pmsg.priority = p
+	pmsg.message = message
+	heap.Push(&pm.messages, pmsg)
 	pm.cond.Signal()
 	return nil
 }
@@ -428,7 +515,10 @@ func (pm *PriorityMailbox) Dequeue() (Message, bool) {
 		return nil, false
 	}
 	pmsg := heap.Pop(&pm.messages).(*PriorityMessage)
-	return pmsg.message, true
+	msg := pmsg.message
+	pmsg.priority, pmsg.message, pmsg.index = 0, nil, 0
+	priorityMessagePool.Put(pmsg)
+	return msg, true
 }
 
 func (pm *PriorityMailbox) Close() {
@@ -445,15 +535,9 @@ type PriorityEnvelope struct {
 
 type priorityQueue []*PriorityMessage
 
-func (pq priorityQueue) Len() int { return len(pq) }
-func (pq priorityQueue) Less(i, j int) bool {
-	return pq[i].priority < pq[j].priority
-}
-func (pq priorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-	pq[i].index = i
-	pq[j].index = j
-}
+func (pq priorityQueue) Len() int           { return len(pq) }
+func (pq priorityQueue) Less(i, j int) bool { return pq[i].priority < pq[j].priority }
+func (pq priorityQueue) Swap(i, j int)      { pq[i], pq[j] = pq[j], pq[i]; pq[i].index = i; pq[j].index = j }
 func (pq *priorityQueue) Push(x any) {
 	n := len(*pq)
 	item := x.(*PriorityMessage)
@@ -469,10 +553,6 @@ func (pq *priorityQueue) Pop() any {
 	return item
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 7. Actor Cell & Execution with Middleware Support
-////////////////////////////////////////////////////////////////////////////////
-
 type actorCell struct {
 	ref         ActorRef
 	actor       Actor
@@ -484,7 +564,7 @@ type actorCell struct {
 	parent      *actorCell
 	children    sync.Map
 	supervisor  SupervisionStrategy
-	interceptor func(ctx ActorContext, msg Message)
+	interceptor func(ctx *ActorContext, msg Message)
 	mu          sync.Mutex
 }
 
@@ -492,11 +572,12 @@ func (cell *actorCell) run() {
 	cell.wg.Add(1)
 	go func() {
 		defer cell.wg.Done()
-		// Recover from panics.
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("actor %s panicked: %v", cell.ref.pid, r)
-				structuredLog("actor_system", "panic recovered", map[string]any{"actor": cell.ref.pid, "error": err.Error()})
+				structuredLog("actor_system", "Panic recovered", map[string]any{
+					"actor": cell.ref.pid, "error": err.Error(), "stack": string(debug.Stack()),
+				})
 				if cell.parent != nil && cell.parent.supervisor != nil {
 					cell.parent.supervisor.HandleFailure(cell, err)
 				}
@@ -504,7 +585,7 @@ func (cell *actorCell) run() {
 		}()
 		actCtx, cancel := context.WithCancel(cell.ctx)
 		cell.cancel = cancel
-		actorContext := ActorContext{
+		actorContext := &ActorContext{
 			Self:       cell.ref,
 			Parent:     nil,
 			Context:    actCtx,
@@ -538,14 +619,17 @@ func (cell *actorCell) run() {
 }
 
 func (cell *actorCell) stop() {
+	actorCtx := &ActorContext{
+		Self:       cell.ref,
+		Parent:     nil,
+		Context:    cell.ctx,
+		CancelFunc: cell.cancel,
+	}
+	cell.actor.BeforeShutdown(actorCtx)
 	cell.cancel()
 	cell.mailbox.Close()
 	cell.wg.Wait()
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Section 8. Supervision & Advanced Restart Strategy
-////////////////////////////////////////////////////////////////////////////////
 
 type SupervisionStrategy interface {
 	HandleFailure(child *actorCell, reason error)
@@ -554,7 +638,7 @@ type SupervisionStrategy interface {
 type OneForOneStrategy struct {
 	maxRestarts int
 	backoff     time.Duration
-	restarts    sync.Map // map[string]int
+	restarts    sync.Map
 }
 
 func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
@@ -562,32 +646,34 @@ func (s *OneForOneStrategy) HandleFailure(child *actorCell, reason error) {
 	countAny, _ := s.restarts.LoadOrStore(actorID, 0)
 	count := countAny.(int)
 	if count >= s.maxRestarts {
-		structuredLog("supervision", "Actor exceeded max restarts", map[string]any{"actor": actorID})
+		structuredLog("supervision", "Max restarts exceeded", map[string]any{"actor": actorID})
 		return
 	}
-	structuredLog("supervision", "Restarting actor", map[string]any{"actor": actorID, "attempt": count + 1})
-	delay := time.Duration(math.Pow(2, float64(count))) * s.backoff
-	time.Sleep(delay)
-	s.restarts.Store(actorID, count+1)
-	actorCtx := ActorContext{
-		Self:    child.ref,
-		Context: child.ctx,
-	}
-	child.actor.PreRestart(actorCtx, reason)
-	child.mu.Lock()
-	if child.props.MailboxType == MailboxPriority {
-		child.mailbox = NewPriorityMailbox()
-	} else {
-		child.mailbox = NewStandardMailbox(child.props.MailboxSize)
-	}
-	child.ref.mailbox = child.mailbox
-	child.mu.Unlock()
-	child.run()
+	structuredLog("supervision", "Scheduling actor restart", map[string]any{"actor": actorID, "attempt": count + 1})
+	actorRestartCount.Add(1)
+	jitter := time.Duration(rand.Int63n(int64(s.backoff)))
+	delay := time.Duration(math.Pow(2, float64(count)))*s.backoff + jitter
+	go func() {
+		time.Sleep(delay)
+		s.restarts.Store(actorID, count+1)
+		actorCtx := &ActorContext{
+			Self:    child.ref,
+			Context: child.ctx,
+		}
+		child.actor.PreRestart(actorCtx, reason)
+		child.mu.Lock()
+		if child.props.MailboxType == MailboxPriority {
+			child.mailbox = NewPriorityMailbox()
+		} else {
+			child.mailbox = NewStandardMailbox(child.props.MailboxSize)
+		}
+		child.ref.mailbox = child.mailbox
+		child.mu.Unlock()
+		// Start the actor and then call AfterRestart hook.
+		child.run()
+		child.actor.AfterRestart(actorCtx)
+	}()
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Section 9. Actor System, Registry & Remote Transport Stub
-////////////////////////////////////////////////////////////////////////////////
 
 type ActorProps struct {
 	MailboxSize  int
@@ -603,30 +689,77 @@ const (
 	MailboxPriority
 )
 
-// RemoteTransport is a stub interface for remote messaging.
 type RemoteTransport interface {
 	SendRemote(actorID string, msg Message) error
 }
 
-// JSONRemoteTransport simulates remote messaging using JSON over HTTP.
 type JSONRemoteTransport struct {
-	endpoint string
-	client   *http.Client
+	endpoint         string
+	client           *http.Client
+	failureCount     int
+	circuitOpen      bool
+	lastFailure      time.Time
+	breakerTimeout   time.Duration
+	FailureThreshold int
+	useMsgPack       bool // New: if true, use msgpack instead of JSON
 }
 
 func (t *JSONRemoteTransport) SendRemote(actorID string, msg Message) error {
-	data, err := json.Marshal(msg)
+	if t.circuitOpen {
+		if time.Since(t.lastFailure) < t.breakerTimeout {
+			structuredLog("remote", "Circuit breaker open, skipping remote call", map[string]any{"actor": actorID})
+			return fmt.Errorf("circuit breaker open: skipping remote call")
+		} else {
+			t.circuitOpen = false
+			t.failureCount = 0
+			structuredLog("remote", "Circuit breaker reset", map[string]any{"actor": actorID})
+		}
+	}
+	var data []byte
+	var err error
+	if t.useMsgPack {
+		// Use msgpack for high-performance binary serialization.
+		data, err = msgpack.Marshal(msg)
+	} else {
+		data, err = json.Marshal(msg)
+	}
 	if err != nil {
 		return fmt.Errorf("serialization error: %w", err)
 	}
-	structuredLog("remote", "Sending remote message", map[string]any{"actor": actorID, "data": string(data)})
-	// In production, perform an HTTP POST.
-	http.Post(t.endpoint, "application/json", nil)
-	return nil
+	maxRetries := 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		structuredLog("remote", "Attempting remote call", map[string]any{"actor": actorID, "attempt": attempt + 1})
+		resp, err := t.client.Post(t.endpoint, "application/json", bytes.NewReader(data))
+		if err != nil {
+			lastErr = err
+		} else {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				t.failureCount = 0
+				return nil
+			} else {
+				lastErr = fmt.Errorf("remote endpoint returned status: %s, response: %s", resp.Status, string(bodyBytes))
+			}
+		}
+		baseDelay := 100 * time.Millisecond
+		backoff := time.Duration(math.Pow(2, float64(attempt))) * baseDelay
+		jitter := time.Duration(rand.Int63n(50 * int64(time.Millisecond)))
+		time.Sleep(backoff + jitter)
+	}
+	t.failureCount++
+	t.lastFailure = time.Now()
+	if t.failureCount >= t.FailureThreshold {
+		t.circuitOpen = true
+		structuredLog("remote", "Circuit breaker opened", map[string]any{"actor": actorID, "failureCount": t.failureCount})
+	}
+	structuredLog("remote", "Failed remote message after retries", map[string]any{"actor": actorID, "maxRetries": maxRetries, "lastError": lastErr.Error()})
+	return fmt.Errorf("failed to send remote message after %d attempts: %w", maxRetries, lastErr)
 }
 
 type ActorSystem struct {
-	registry        sync.Map // map[string]*actorCell
+	registry        sync.Map
 	ctx             context.Context
 	cancel          context.CancelFunc
 	supervisor      SupervisionStrategy
@@ -638,12 +771,18 @@ type ActorSystem struct {
 func NewActorSystem(cfg *Config) *ActorSystem {
 	ctx, cancel := context.WithCancel(context.Background())
 	supervisor := &OneForOneStrategy{maxRestarts: cfg.MaxRestarts, backoff: cfg.BackoffBase}
+	startTimeCtx := context.WithValue(ctx, startTimeKey, time.Now())
 	return &ActorSystem{
-		ctx:             ctx,
-		cancel:          cancel,
-		supervisor:      supervisor,
-		remoteTransport: &JSONRemoteTransport{endpoint: cfg.RemoteEndpoint, client: &http.Client{}},
-		config:          cfg,
+		ctx:        startTimeCtx,
+		cancel:     cancel,
+		supervisor: supervisor,
+		remoteTransport: &JSONRemoteTransport{
+			endpoint:         cfg.RemoteEndpoint,
+			client:           &http.Client{Timeout: 10 * time.Second},
+			breakerTimeout:   5 * time.Second,
+			FailureThreshold: 3,
+		},
+		config: cfg,
 	}
 }
 
@@ -660,22 +799,10 @@ func (sys *ActorSystem) Spawn(pid string, actor Actor, props ActorProps) *ActorR
 		}
 		mbox = NewStandardMailbox(capacity)
 	}
-	ref := ActorRef{
-		pid:     pid,
-		mailbox: mbox,
-		system:  sys,
-	}
-	cell := &actorCell{
-		ref:        ref,
-		actor:      actor,
-		mailbox:    mbox,
-		props:      props,
-		ctx:        actorCtx,
-		supervisor: sys.supervisor,
-	}
-	// Compose interceptor chain if interceptors provided.
+	ref := ActorRef{pid: pid, mailbox: mbox, system: sys}
+	cell := &actorCell{ref: ref, actor: actor, mailbox: mbox, props: props, ctx: actorCtx, supervisor: sys.supervisor}
 	if len(props.Interceptors) > 0 {
-		cell.interceptor = ChainInterceptors(func(ctx ActorContext, msg Message) {
+		cell.interceptor = ChainInterceptors(func(ctx *ActorContext, msg Message) {
 			switch env := msg.(type) {
 			case Envelope:
 				actor.Receive(ctx, env)
@@ -694,7 +821,7 @@ func (sys *ActorSystem) Spawn(pid string, actor Actor, props ActorProps) *ActorR
 func (sys *ActorSystem) Stop(pid string) error {
 	value, ok := sys.registry.Load(pid)
 	if !ok {
-		return fmt.Errorf("actor with pid %s not found", pid)
+		return fmt.Errorf("actor %s not found", pid)
 	}
 	cell := value.(*actorCell)
 	cell.stop()
@@ -712,14 +839,55 @@ func (sys *ActorSystem) Shutdown() {
 		sys.activeActors.Add(-1)
 		return true
 	})
+	stopDeadLetterProcessor()
 	sys.cancel()
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	structuredLog("shutdown", "Actor system shutdown complete", nil)
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 10. Router Implementations (Round-Robin & Consistent Hashing Stub)
-////////////////////////////////////////////////////////////////////////////////
+func (sys *ActorSystem) ServeHealthCheck(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		startTime, _ := sys.ctx.Value(startTimeKey).(time.Time)
+		status := map[string]any{
+			"active_actors": sys.activeActors.Load(),
+			"uptime":        time.Since(startTime).String(),
+		}
+		data, _ := json.Marshal(status)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metricsData := map[string]any{
+			"active_actors": sys.activeActors.Load(),
+			"start_time":    sys.ctx.Value(startTimeKey),
+		}
+		data, _ := json.Marshal(metricsData)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	})
+	go func() {
+		structuredLog("health", "Starting health endpoint", map[string]any{"address": addr})
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			structuredLog("health", "Endpoint error", map[string]any{"error": err.Error()})
+		}
+	}()
+}
+
+func (sys *ActorSystem) ListActors() []map[string]any {
+	var actors []map[string]any
+	sys.registry.Range(func(key, value any) bool {
+		cell := value.(*actorCell)
+		actors = append(actors, map[string]any{
+			"pid":         cell.ref.pid,
+			"mailboxType": cell.props.MailboxType,
+		})
+		return true
+	})
+	return actors
+}
 
 type Router struct {
 	actors  []*ActorRef
@@ -733,13 +901,11 @@ func NewRoundRobinRouter(actors []*ActorRef) *Router {
 func (r *Router) Route(message Message) {
 	idx := atomic.AddUint64(&r.counter, 1)
 	target := r.actors[int(idx)%len(r.actors)]
-	err := target.Tell(message)
-	if err != nil {
-		structuredLog("router", "Error sending message", map[string]any{"error": err.Error()})
+	if err := target.Tell(message); err != nil {
+		structuredLog("router", "Error sending", map[string]any{"error": err.Error()})
 	}
 }
 
-// ConsistentHashRouter stub for future extension.
 type ConsistentHashRouter struct {
 	actors []*ActorRef
 }
@@ -755,13 +921,9 @@ func (r *ConsistentHashRouter) RouteByKey(message Message, key string) {
 	}
 	index := hash % len(r.actors)
 	if err := r.actors[index].Tell(message); err != nil {
-		structuredLog("router", "Error sending message", map[string]any{"error": err.Error()})
+		structuredLog("router", "Error sending", map[string]any{"error": err.Error()})
 	}
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Section 11. Type-Safe Messages using Generics
-////////////////////////////////////////////////////////////////////////////////
 
 type TypedMessage[T any] struct {
 	Payload T
@@ -771,10 +933,6 @@ func NewTypedMessage[T any](payload T) TypedMessage[T] {
 	return TypedMessage[T]{Payload: payload}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 12. ActorContext Definition
-////////////////////////////////////////////////////////////////////////////////
-
 type ActorContext struct {
 	Self       ActorRef
 	Parent     *ActorRef
@@ -782,41 +940,54 @@ type ActorContext struct {
 	CancelFunc context.CancelFunc
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 13. Health Check Endpoint for Operational Monitoring
-////////////////////////////////////////////////////////////////////////////////
-
-func (sys *ActorSystem) ServeHealthCheck(addr string) {
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		status := map[string]any{
-			"active_actors": sys.activeActors.Load(),
-			"uptime":        time.Since(sys.ctx.Value("startTime").(time.Time)).String(),
-		}
-		data, _ := json.Marshal(status)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
-	})
-	go func() {
-		structuredLog("health", "Starting health endpoint", map[string]any{"address": addr})
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			structuredLog("health", "Health endpoint error", map[string]any{"error": err.Error()})
-		}
-	}()
+type RequestMessage struct {
+	ID            string
+	Payload       string
+	Reply         chan ResponseMessage
+	CorrelationID string
+	FiberCtx      *fiber.Ctx
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 14. Example Actor Implementations
-////////////////////////////////////////////////////////////////////////////////
+type RequestHandlerActor struct{}
+
+func (a *RequestHandlerActor) PreStart(ctx *ActorContext) {
+	structuredLog("actor", "RequestHandlerActor starting", nil)
+}
+
+func (a *RequestHandlerActor) Receive(ctx *ActorContext, msg Message) {
+	switch req := msg.(type) {
+	case RequestMessage:
+		response := fmt.Sprintf("Processed request %s with payload: %s", req.ID, req.Payload)
+		req.Reply <- ResponseMessage{Data: response}
+	default:
+		structuredLog("actor", "RequestHandlerActor unknown message", map[string]any{"message": msg})
+	}
+}
+
+func (a *RequestHandlerActor) PostStop(ctx *ActorContext) {
+	structuredLog("actor", "RequestHandlerActor stopping", nil)
+}
+
+func (a *RequestHandlerActor) PreRestart(ctx *ActorContext, reason error) {
+	structuredLog("actor", "RequestHandlerActor restarting", map[string]any{"reason": reason.Error()})
+}
+
+func (a *RequestHandlerActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "RequestHandlerActor after restart", nil)
+}
+
+func (a *RequestHandlerActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "RequestHandlerActor before shutdown", nil)
+}
 
 type EchoActor struct {
 	name string
 	BaseActor
 }
 
-func (a *EchoActor) PreStart(ctx ActorContext) {
+func (a *EchoActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor starting", map[string]any{"actor": a.name})
-	a.Become(func(ctx ActorContext, msg Message) {
+	a.Become(func(ctx *ActorContext, msg Message) {
 		switch env := msg.(type) {
 		case Envelope:
 			structuredLog("actor", "EchoActor received envelope", map[string]any{"actor": a.name, "message": env.Message})
@@ -830,23 +1001,31 @@ func (a *EchoActor) PreStart(ctx ActorContext) {
 	})
 }
 
-func (a *EchoActor) Receive(ctx ActorContext, msg Message) {
+func (a *EchoActor) Receive(ctx *ActorContext, msg Message) {
 	a.DefaultReceive(ctx, msg)
 }
 
-func (a *EchoActor) PostStop(ctx ActorContext) {
+func (a *EchoActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "EchoActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *EchoActor) PreRestart(ctx ActorContext, reason error) {
+func (a *EchoActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "EchoActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
+}
+
+func (a *EchoActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "EchoActor after restart", map[string]any{"actor": a.name})
+}
+
+func (a *EchoActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "EchoActor before shutdown", map[string]any{"actor": a.name})
 }
 
 type TimerActor struct {
 	name string
 }
 
-func (a *TimerActor) PreStart(ctx ActorContext) {
+func (a *TimerActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor starting", map[string]any{"actor": a.name})
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -864,16 +1043,24 @@ func (a *TimerActor) PreStart(ctx ActorContext) {
 	}()
 }
 
-func (a *TimerActor) Receive(ctx ActorContext, msg Message) {
+func (a *TimerActor) Receive(ctx *ActorContext, msg Message) {
 	structuredLog("actor", "TimerActor received message", map[string]any{"actor": a.name, "message": msg})
 }
 
-func (a *TimerActor) PostStop(ctx ActorContext) {
+func (a *TimerActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "TimerActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *TimerActor) PreRestart(ctx ActorContext, reason error) {
+func (a *TimerActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "TimerActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
+}
+
+func (a *TimerActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "TimerActor after restart", map[string]any{"actor": a.name})
+}
+
+func (a *TimerActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "TimerActor before shutdown", map[string]any{"actor": a.name})
 }
 
 type PersistentActor struct {
@@ -882,14 +1069,14 @@ type PersistentActor struct {
 	BaseActor
 }
 
-func (a *PersistentActor) PreStart(ctx ActorContext) {
+func (a *PersistentActor) PreStart(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor starting", map[string]any{"actor": a.name})
 	if restored, err := persistenceManager.RestoreSnapshot(a.name); err == nil {
 		a.state = restored.(map[string]any)
 	} else {
 		a.state = make(map[string]any)
 	}
-	a.Become(func(ctx ActorContext, msg Message) {
+	a.Become(func(ctx *ActorContext, msg Message) {
 		structuredLog("actor", "PersistentActor processing", map[string]any{"actor": a.name, "message": msg})
 		a.state["lastMessage"] = msg
 		_ = persistenceManager.SaveSnapshot(a.name, a.state)
@@ -897,100 +1084,234 @@ func (a *PersistentActor) PreStart(ctx ActorContext) {
 	})
 }
 
-func (a *PersistentActor) Receive(ctx ActorContext, msg Message) {
+func (a *PersistentActor) Receive(ctx *ActorContext, msg Message) {
 	a.DefaultReceive(ctx, msg)
 }
 
-func (a *PersistentActor) PostStop(ctx ActorContext) {
+func (a *PersistentActor) PostStop(ctx *ActorContext) {
 	structuredLog("actor", "PersistentActor stopping", map[string]any{"actor": a.name})
 }
 
-func (a *PersistentActor) PreRestart(ctx ActorContext, reason error) {
+func (a *PersistentActor) PreRestart(ctx *ActorContext, reason error) {
 	structuredLog("actor", "PersistentActor restarting", map[string]any{"actor": a.name, "reason": reason.Error()})
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section X. HTTP Actor for Fiber Integration
-////////////////////////////////////////////////////////////////////////////////
-
-type HttpRequestMessage struct {
-	HTTPMethod  string
-	Path        string
-	QueryParams map[string]string
-	Body        []byte
-	ReplyChan   chan string
+func (a *PersistentActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "PersistentActor after restart", map[string]any{"actor": a.name})
 }
 
-type HttpActor struct {
-	BaseActor
+func (a *PersistentActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "PersistentActor before shutdown", map[string]any{"actor": a.name})
 }
 
-func (a *HttpActor) PreStart(ctx ActorContext) {
-	structuredLog("actor", "HttpActor starting", map[string]any{"actor": ctx.Self.pid})
-	a.Become(a.handleRequest)
+type RequestWrapperActor struct {
+	id      string
+	handler fiber.Handler
 }
 
-func (a *HttpActor) handleRequest(ctx ActorContext, msg Message) {
-	// Unwrap the message if it is an Envelope.
-	var reqMsg HttpRequestMessage
-	switch m := msg.(type) {
-	case Envelope:
-		var ok bool
-		reqMsg, ok = m.Message.(HttpRequestMessage)
-		if !ok {
-			structuredLog("actor", "HttpActor received invalid envelope payload", map[string]any{"actor": ctx.Self.pid})
-			return
+func (a *RequestWrapperActor) PreStart(ctx *ActorContext) {
+	structuredLog("actor", "RequestWrapperActor starting", map[string]any{"actor": a.id})
+}
+
+func (a *RequestWrapperActor) Receive(ctx *ActorContext, msg Message) {
+	switch req := msg.(type) {
+	case RequestMessage:
+		structuredLog("actor", "RequestWrapperActor processing", map[string]any{"actor": a.id, "payload": req.Payload})
+		if req.FiberCtx != nil {
+
+			err := a.handler(req.FiberCtx)
+			if req.Reply != nil {
+				if err != nil {
+					req.Reply <- ResponseMessage{Data: nil, Err: err}
+				} else {
+					req.Reply <- ResponseMessage{Data: "processed via fiber.Handler", Err: nil}
+				}
+			}
+		} else {
+
 		}
-	case HttpRequestMessage:
-		reqMsg = m
-	default:
-		structuredLog("actor", "HttpActor received unknown message type", map[string]any{"actor": ctx.Self.pid})
-		return
 	}
-	// Generate a response with current timestamp.
-	response := fmt.Sprintf("Handled %s request for %s at %s", reqMsg.HTTPMethod, reqMsg.Path, time.Now().Format(time.RFC3339))
-	reqMsg.ReplyChan <- response
 }
 
-func (a *HttpActor) Receive(ctx ActorContext, msg Message) {
-	a.DefaultReceive(ctx, msg)
+func (a *RequestWrapperActor) PostStop(ctx *ActorContext) {
+	structuredLog("actor", "RequestWrapperActor stopping", map[string]any{"actor": a.id})
 }
 
-func (a *HttpActor) PostStop(ctx ActorContext) {
-	structuredLog("actor", "HttpActor stopping", map[string]any{"actor": ctx.Self.pid})
+func (a *RequestWrapperActor) PreRestart(ctx *ActorContext, reason error) {
+	structuredLog("actor", "RequestWrapperActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
 }
 
-func (a *HttpActor) PreRestart(ctx ActorContext, reason error) {
-	structuredLog("actor", "HttpActor restarting", map[string]any{"actor": ctx.Self.pid, "reason": reason.Error()})
+func (a *RequestWrapperActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "RequestWrapperActor after restart", map[string]any{"actor": a.id})
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Section 15. Main Function (Updated for Fiber HTTP Server)
-////////////////////////////////////////////////////////////////////////////////
+func (a *RequestWrapperActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "RequestWrapperActor before shutdown", map[string]any{"actor": a.id})
+}
+
+type RemoteActor struct {
+	id string
+}
+
+func (a *RemoteActor) PreStart(ctx *ActorContext) {
+	structuredLog("actor", "RemoteActor starting", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) Receive(ctx *ActorContext, msg Message) {
+	err := ctx.Self.system.remoteTransport.SendRemote(ctx.Self.pid, msg)
+	if err != nil {
+		structuredLog("remoteActor", "Remote sending failed", map[string]any{"actor": a.id, "error": err.Error()})
+	}
+	if env, ok := msg.(Envelope); ok && env.ReplyChan != nil {
+		env.ReplyChan <- ResponseMessage{Data: fmt.Sprintf("Remote actor %s processed message", a.id), Err: err}
+	}
+}
+
+func (a *RemoteActor) PostStop(ctx *ActorContext) {
+	structuredLog("actor", "RemoteActor stopping", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) PreRestart(ctx *ActorContext, reason error) {
+	structuredLog("actor", "RemoteActor restarting", map[string]any{"actor": a.id, "reason": reason.Error()})
+}
+
+func (a *RemoteActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "RemoteActor after restart", map[string]any{"actor": a.id})
+}
+
+func (a *RemoteActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "RemoteActor before shutdown", map[string]any{"actor": a.id})
+}
+
+type CombinedActor struct {
+	children []*ActorRef
+}
+
+func (a *CombinedActor) PreStart(ctx *ActorContext) {
+	structuredLog("actor", "CombinedActor starting", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) Receive(ctx *ActorContext, msg Message) {
+	switch req := msg.(type) {
+	case Envelope:
+		var wg sync.WaitGroup
+		mu := sync.Mutex{}
+		results := []string{}
+		for _, child := range a.children {
+			wg.Add(1)
+			go func(child *ActorRef) {
+				defer wg.Done()
+				request := RequestMessage{
+					ID:      fmt.Sprintf("child-req-%s", child.pid),
+					Payload: fmt.Sprintf("data from %s", child.pid),
+					Reply:   make(chan ResponseMessage, 1),
+				}
+				resp, err := child.system.Spawn(child.pid, nil, ActorProps{}).Ask(request, 2*time.Second)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					results = append(results, fmt.Sprintf("%s:error:%v", child.pid, err))
+				} else {
+					results = append(results, fmt.Sprintf("%s:%v", child.pid, resp.Data))
+				}
+			}(child)
+		}
+		wg.Wait()
+		aggregated := ""
+		for _, r := range results {
+			aggregated += r + "; "
+		}
+		if req.ReplyChan != nil {
+			req.ReplyChan <- ResponseMessage{Data: aggregated, Err: nil}
+		}
+	default:
+		structuredLog("actor", "CombinedActor received unknown message", map[string]any{"message": msg})
+	}
+}
+
+func (a *CombinedActor) PostStop(ctx *ActorContext) {
+	structuredLog("actor", "CombinedActor stopping", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) PreRestart(ctx *ActorContext, reason error) {
+	structuredLog("actor", "CombinedActor restarting", map[string]any{"actor": "CombinedActor", "reason": reason.Error()})
+}
+
+func (a *CombinedActor) AfterRestart(ctx *ActorContext) {
+	structuredLog("actor", "CombinedActor after restart", map[string]any{"actor": "CombinedActor"})
+}
+
+func (a *CombinedActor) BeforeShutdown(ctx *ActorContext) {
+	structuredLog("actor", "CombinedActor before shutdown", map[string]any{"actor": "CombinedActor"})
+}
 
 func main() {
-	// Load configuration (assumes config.yaml in working directory).
-	cfg, err := LoadConfig("config.yaml")
+	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
+	flag.Parse()
+	initLogger()
+	defer logger.Sync()
+	startedAt := time.Now()
+	cfg, err := LoadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		logger.Fatal("Failed to load config", zap.Error(err))
 	}
-	// Save start time in context for health checks.
-	ctx := context.WithValue(context.Background(), "startTime", time.Now())
-
-	// Create actor system.
+	watchConfig(*configPath, &cfg, 30*time.Second)
+	ctx := context.WithValue(context.Background(), startTimeKey, startedAt)
+	startDeadLetterProcessor()
 	system := NewActorSystem(cfg)
 	system.ctx = ctx
-
-	// Start health check server.
 	system.ServeHealthCheck(cfg.HealthCheckEndpoint)
-
-	// Compose interceptors.
 	interceptors := []MessageInterceptor{
 		LoggingInterceptor,
 		RateLimitingInterceptor(cfg.RateLimitPerSecond),
+		MetricsInterceptor,
 	}
-
-	// Spawn an EchoActor.
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  10 * time.Second,
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			structuredLog("fiber", "Unhandled error", map[string]any{"error": err.Error()})
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		},
+	})
+	app.Use(func(c *fiber.Ctx) error {
+		if corrID := c.Get("X-Correlation-ID"); corrID != "" {
+			c.Locals("correlation_id", corrID)
+		}
+		return c.Next()
+	})
+	app.Use(recoverMw.New())
+	adminMiddleware := func(c *fiber.Ctx) error {
+		token := c.Get("X-Admin-Token")
+		if token == "" || token != cfg.AdminToken {
+			return c.Status(fiber.StatusUnauthorized).JSON(map[string]any{"error": "Unauthorized"})
+		}
+		return c.Next()
+	}
+	admin := app.Group("/admin", adminMiddleware)
+	admin.Get("/ui", func(c *fiber.Ctx) error {
+		return c.Type("html").SendFile("/Users/sujit/Sites/go-app/admin.html")
+	})
+	admin.Get("/api/actors", func(c *fiber.Ctx) error {
+		actors := system.ListActors()
+		return c.JSON(actors)
+	})
+	admin.Get("/api/actors/:id/events", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		events, err := eventLogger.GetEvents(actorID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"actor": actorID, "events": events})
+	})
+	admin.Post("/api/actors/:id/stop", func(c *fiber.Ctx) error {
+		actorID := c.Params("id")
+		if err := system.Stop(actorID); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]any{"error": err.Error()})
+		}
+		return c.JSON(map[string]any{"message": "Actor " + actorID + " stopped"})
+	})
 	echoProps := ActorProps{
 		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
@@ -998,111 +1319,120 @@ func main() {
 	}
 	echo := &EchoActor{name: "Echo1"}
 	echoRef := system.Spawn("echo1", echo, echoProps)
-
-	// Spawn additional EchoActors for routing.
 	var poolRefs []*ActorRef
 	for i := 2; i <= 4; i++ {
 		a := &EchoActor{name: fmt.Sprintf("Echo%d", i)}
 		ref := system.Spawn(fmt.Sprintf("echo%d", i), a, echoProps)
 		poolRefs = append(poolRefs, ref)
 	}
-
-	// Create a round-robin router for EchoActors.
 	router := NewRoundRobinRouter(poolRefs)
-
-	// Demonstrate Tell and Ask.
-	if err := echoRef.Tell("Hello, Actor!"); err != nil {
-		structuredLog("main", "Failed to send message", map[string]any{"error": err.Error()})
-	}
-	resp, err := echoRef.Ask("Ping", 3*time.Second)
-	if err != nil {
-		structuredLog("main", "Ask error", map[string]any{"error": err.Error()})
-	} else {
-		structuredLog("main", "Received response", map[string]any{"response": resp})
-	}
-
-	// Route some messages via router.
-	for i := 0; i < 5; i++ {
-		router.Route(fmt.Sprintf("Message #%d", i+1))
-	}
-
-	// Spawn a TimerActor.
 	timerActor := &TimerActor{name: "Timer1"}
 	system.Spawn("timer1", timerActor, ActorProps{
 		MailboxSize:  cfg.MailboxSize,
 		MailboxType:  MailboxStandard,
 		Interceptors: interceptors,
 	})
-
-	// Spawn a PersistentActor.
 	persistentActor := &PersistentActor{name: "Persist1"}
 	system.Spawn("persist1", persistentActor, ActorProps{
 		MailboxSize:  cfg.MailboxSize + 5,
 		MailboxType:  MailboxStandard,
 		Interceptors: interceptors,
 	})
-
-	// Pub/Sub demonstration: subscribe EchoActor to topic "news".
+	remoteActor := &RemoteActor{id: "Remote1"}
+	system.Spawn("remote1", remoteActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize,
+		MailboxType:  MailboxStandard,
+		Interceptors: interceptors,
+		Remote:       true,
+	})
+	combinedActor := &CombinedActor{children: poolRefs}
+	system.Spawn("combined1", combinedActor, ActorProps{
+		MailboxSize:  cfg.MailboxSize,
+		MailboxType:  MailboxStandard,
+		Interceptors: interceptors,
+	})
 	globalPubSub.Subscribe("news", echoRef)
 	globalPubSub.Publish("news", "Breaking: New Actor Framework Released!")
-
-	////////////////////////////////////////////////////////////////////////////////
-	// Fiber HTTP Server Integration
-	////////////////////////////////////////////////////////////////////////////////
-
-	app := fiber.New()
-
-	// Create an HTTP actor pool.
-	var httpActors []*ActorRef
-	for i := 1; i <= 3; i++ {
-		httpActor := &HttpActor{}
-		ref := system.Spawn(fmt.Sprintf("http%d", i), httpActor, ActorProps{
+	app.Post("/process", func(c *fiber.Ctx) error {
+		reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
+		corrID := c.Get("X-Correlation-ID", "")
+		replyChan := make(chan ResponseMessage, 1)
+		reqMsg := RequestMessage{
+			ID:            reqID,
+			Reply:         replyChan,
+			CorrelationID: corrID,
+			FiberCtx:      c,
+		}
+		handler := func(c *fiber.Ctx) error {
+			structuredLog("handler", "Processing fiber request", map[string]any{"actor": reqID})
+			return c.JSON(map[string]string{
+				"result": "processed request via RequestWrapperActor",
+			})
+		}
+		requestActor := &RequestWrapperActor{
+			id:      reqID,
+			handler: handler,
+		}
+		actorRef := system.Spawn(reqID, requestActor, ActorProps{
 			MailboxSize:  cfg.MailboxSize,
 			MailboxType:  MailboxStandard,
 			Interceptors: interceptors,
 		})
-		httpActors = append(httpActors, ref)
-	}
-	// Create a round-robin router for HTTP actors.
-	httpRouter := NewRoundRobinRouter(httpActors)
-
-	// Define a catch-all handler.
-	app.All("/*", func(c *fiber.Ctx) error {
-		replyChan := make(chan string, 1)
-		reqMsg := HttpRequestMessage{
-			HTTPMethod:  c.Method(),
-			Path:        c.Path(),
-			QueryParams: map[string]string{}, // For brevity; you could extract query params.
-			Body:        c.Body(),
-			ReplyChan:   replyChan,
+		if err := actorRef.Tell(reqMsg); err != nil {
+			return c.Status(fiber.StatusInternalServerError).SendString("Actor error")
 		}
-		// Manually select an actor using round-robin.
-		actorIdx := int(atomic.AddUint64(&httpRouter.counter, 1)) % len(httpActors)
-		resp, err := httpActors[actorIdx].Ask(reqMsg, 3*time.Second)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).SendString("Error processing request")
+		select {
+		case resp := <-replyChan:
+			_ = system.Stop(reqID)
+			if resp.Err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(map[string]any{"error": resp.Err.Error()})
+			}
+			return c.JSON(map[string]any{"response": resp.Data})
+		case <-time.After(3 * time.Second):
+			_ = system.Stop(reqID)
+			return c.Status(fiber.StatusGatewayTimeout).SendString("Timeout")
 		}
-		responseStr, ok := resp.Data.(string)
-		if !ok {
-			responseStr = "Invalid response"
-		}
-		return c.SendString(responseStr)
 	})
-
-	// Start the Fiber server.
+	app.Get("/benchmark", func(c *fiber.Ctx) error {
+		const iterations = 10_000_000
+		start := time.Now()
+		for i := 0; i < iterations; i++ {
+			_ = echoRef.Tell(fmt.Sprintf("msg %d", i))
+		}
+		duration := time.Since(start)
+		return c.JSON(map[string]any{"messages": iterations, "duration_ms": duration.Milliseconds()})
+	})
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		return c.JSON(map[string]any{
+			"active_actors": system.activeActors.Load(),
+			"start_time":    system.ctx.Value(startTimeKey),
+		})
+	})
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	go func() {
-		if err := app.Listen(":3000"); err != nil {
-			structuredLog("fiber", "Fiber server error", map[string]any{"error": err.Error()})
+		if err := app.Listen(cfg.HTTPPort); err != nil {
+			logger.Fatal("Fiber server error", zap.Error(err))
 		}
 	}()
-	structuredLog("main", "Fiber HTTP server started on :3000", nil)
-
-	// Let the whole system run.
-	time.Sleep(30 * time.Second)
-
-	// Gracefully shutdown the Fiber server and the actor system.
-	_ = app.Shutdown()
-	structuredLog("main", "Shutting down actor system...", nil)
+	for i := 0; i < 5; i++ {
+		router.Route(fmt.Sprintf("Route Message #%d", i+1))
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	structuredLog("shutdown", "Memory stats", map[string]any{
+		"Alloc":      m.Alloc,
+		"TotalAlloc": m.TotalAlloc,
+		"Sys":        m.Sys,
+		"NumGC":      m.NumGC,
+	})
+	<-shutdownCtx.Done()
+	structuredLog("shutdown", "Shutdown signal received", map[string]any{"signal": "context cancellation"})
+	shutdownCtxTimeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := app.ShutdownWithContext(shutdownCtxTimeout); err != nil {
+		structuredLog("shutdown", "Fiber shutdown error", map[string]any{"error": err.Error()})
+	}
 	system.Shutdown()
-	structuredLog("main", "Actor system shutdown complete.", nil)
+	os.Exit(0)
 }
