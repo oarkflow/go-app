@@ -66,7 +66,7 @@ func main() {
 
 	fmt.Printf("Your Peer ID: %s\n", host.ID())
 	for _, addr := range host.Addrs() {
-		fmt.Printf(" - %s/p2p/%s\n", addr, host.ID().ShortString())
+		fmt.Printf(" - %s/p2p/%s\n", addr, host.ID())
 	}
 
 	// Start mDNS
@@ -121,34 +121,59 @@ func tryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid st
 	if peerInfo.ID == h.ID() {
 		return
 	}
-	// Debug: log connection attempt with addresses.
-	fmt.Println("🔍 Attempting connection to", peerInfo.ID, "with addrs:", peerInfo.Addrs)
-	// Use a timeout for connection attempts.
-	ctxConnect, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := h.Connect(ctxConnect, peerInfo); err != nil {
-		if strings.Contains(err.Error(), "noise: message is too short") {
-			// Quietly ignore noise handshake errors.
-			return
-		}
-		// Log connection failure.
-		fmt.Println("🔗 Connection skipped for", peerInfo.ID, "error:", err)
+	// Check for reachable addresses.
+	if len(peerInfo.Addrs) == 0 {
+		fmt.Println("⚠️ No addresses for", peerInfo.ID, "- skipping connection")
 		return
 	}
-	fmt.Println("🔗 Connected to", peerInfo.ID)
-
+	fmt.Println("🔍 Attempting connection to", peerInfo.ID, "with addrs:", peerInfo.Addrs)
+	// If already connected, skip dialing.
+	connected := false
+	for _, conn := range h.Network().Conns() {
+		if conn.RemotePeer() == peerInfo.ID {
+			connected = true
+			break
+		}
+	}
+	if !connected {
+		ctxConnect, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := h.Connect(ctxConnect, peerInfo); err != nil {
+			fmt.Println("🔗 Connection failed for", peerInfo.ID, "error:", err)
+			go retryConnect(ctx, h, peerInfo, pid)
+			return
+		}
+	}
 	stream, err := h.NewStream(ctx, peerInfo.ID, protocol.ID(pid))
 	if err != nil {
-		// Log stream open failure.
 		fmt.Println("🔗 Stream open failed for", peerInfo.ID, "error:", err)
+		go retryConnect(ctx, h, peerInfo, pid)
 		return
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
-	// Register the new stream.
 	peersMu.Lock()
 	peers = append(peers, rw)
 	peersMu.Unlock()
 	go readData(rw)
+}
+
+// New function to retry connection if not already connected.
+func retryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid string) {
+	time.Sleep(5 * time.Second)
+	// Check if already connected to the specific peer.
+	connected := false
+	for _, conn := range h.Network().Conns() {
+		if conn.RemotePeer() == peerInfo.ID {
+			connected = true
+			break
+		}
+	}
+	if connected {
+		fmt.Println("✅ Already connected to", peerInfo.ID)
+		return
+	}
+	fmt.Println("🔄 Retrying connection to", peerInfo.ID)
+	tryConnect(ctx, h, peerInfo, pid)
 }
 
 // New function to remove a peer from the peers slice.
