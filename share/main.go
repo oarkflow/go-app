@@ -1,266 +1,381 @@
-// p2p_file_transfer.go
-// A self-contained Go program for peer-to-peer file transfer using WebRTC (pion/webrtc)
-// Supports:
-//   - role=offer: send a file
-//   - role=answer: receive a file
-// Signaling is done via base64-encoded SDP printed/read on the terminal (manual copy-paste).
-
 package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v3"
+	logging "github.com/ipfs/go-log/v2"
+	libp2p "github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	maddr "github.com/multiformats/go-multiaddr"
 )
 
-func must(err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-}
+var logger = logging.Logger("chat")
+
+// Add global peers slice to manage active streams.
+var (
+	peersMu sync.Mutex
+	peers   []*bufio.ReadWriter
+)
 
 func main() {
-	role := flag.String("role", "", "Role: 'offer' to send, 'answer' to receive")
-	filePath := flag.String("file", "", "File path to send (offer mode)")
-	outPath := flag.String("out", "received.bin", "Output path to save received file (answer mode)")
-	stun := flag.String("stun", "stun:stun.l.google.com:19302", "STUN server URL")
-	// New flags for signaling
-	signalMethod := flag.String("signal", "manual", "Signaling method: 'manual' or 'auto'")
-	srvAddr := flag.String("srv", "localhost:12345", "Signaling server address for auto mode")
-	flag.Parse()
+	// Disable verbose logs to beautify terminal output
+	logging.SetLogLevel("*", "error")
+	logging.SetLogLevel("chat", "error")
 
-	if *role != "offer" && *role != "answer" {
-		flag.Usage()
-		os.Exit(1)
+	config, err := ParseFlags()
+	if err != nil {
+		panic(err)
 	}
 
-	// 1. Create PeerConnection
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{*stun}}},
+	ctx := context.Background()
+
+	// Create a persistent identity for a consistent PeerID.
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 2048)
+	if err != nil {
+		panic(err)
 	}
-	pc, err := webrtc.NewPeerConnection(config)
-	must(err)
-	// Choose signaling method
-	if *role == "offer" {
-		if *signalMethod == "auto" {
-			runOfferAuto(pc, *filePath, *srvAddr)
-		} else {
-			runOffer(pc, *filePath)
+
+	host, err := libp2p.New(
+		libp2p.Identity(priv), // ensure persistent identity
+		libp2p.ListenAddrs(config.ListenAddresses...),
+		libp2p.Security(noise.ID, noise.New),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	host.SetStreamHandler(protocol.ID(config.ProtocolID), handleStream)
+
+	fmt.Printf("Your Peer ID: %s\n", host.ID())
+	for _, addr := range host.Addrs() {
+		fmt.Printf(" - %s/p2p/%s\n", addr, host.ID())
+	}
+
+	// Start mDNS
+	mdnsChan := initMDNS(host, config.RendezvousString)
+
+	// Start DHT
+	kademliaDHT, err := dht.New(ctx, host)
+	if err != nil {
+		panic(err)
+	}
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		panic(err)
+	}
+
+	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
+	dutil.Advertise(ctx, routingDiscovery, config.RendezvousString)
+
+	dhtChan, err := routingDiscovery.FindPeers(ctx, config.RendezvousString)
+	if err != nil {
+		panic(err)
+	}
+
+	// Merge mDNS and DHT discovery
+	go func() {
+		for peer := range dhtChan {
+			tryConnect(ctx, host, peer, config.ProtocolID)
 		}
-	} else {
-		if *signalMethod == "auto" {
-			runAnswerAuto(pc, *outPath, *srvAddr)
-		} else {
-			runAnswer(pc, *outPath)
+	}()
+	go func() {
+		for peer := range mdnsChan {
+			tryConnect(ctx, host, peer, config.ProtocolID)
 		}
-	}
+	}()
 
-	// Block forever
+	// After launching discovery routines, start reading console input.
+	go readConsole()
+
 	select {}
 }
 
-func runOffer(pc *webrtc.PeerConnection, path string) {
-	// 2. Create DataChannel
-	dc, err := pc.CreateDataChannel("file", nil)
-	must(err)
-
-	// On open, start streaming the file
-	dc.OnOpen(func() {
-		fmt.Println("DataChannel open, sending file...")
-		sendFile(dc, path)
-		dc.Close()
-		pc.Close()
-		fmt.Println("File sent successfully")
-		os.Exit(0)
-	})
-
-	// Signaling
-	offer, err := pc.CreateOffer(nil)
-	must(err)
-	must(pc.SetLocalDescription(offer))
-	<-webrtc.GatheringCompletePromise(pc)
-
-	printSDP("OFFER", pc.LocalDescription().SDP)
-
-	// Read remote answer
-	answerSDP := readSDPFromStdin("ANSWER")
-	must(pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}))
+func handleStream(stream network.Stream) {
+	fmt.Println("📡 Incoming stream from", stream.Conn().RemotePeer())
+	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+	// Register the new stream.
+	peersMu.Lock()
+	peers = append(peers, rw)
+	peersMu.Unlock()
+	go readData(rw)
 }
 
-// New function: automatic signaling for the offer role.
-func runOfferAuto(pc *webrtc.PeerConnection, path, srv string) {
-	// Create DataChannel as in runOffer
-	dc, err := pc.CreateDataChannel("file", nil)
-	must(err)
-	dc.OnOpen(func() {
-		fmt.Println("DataChannel open, sending file...")
-		sendFile(dc, path)
-		dc.Close()
-		pc.Close()
-		fmt.Println("File sent successfully")
-		os.Exit(0)
-	})
-
-	offer, err := pc.CreateOffer(nil)
-	must(err)
-	must(pc.SetLocalDescription(offer))
-	<-webrtc.GatheringCompletePromise(pc)
-
-	// Auto signaling: listen for remote connection
-	ln, err := net.Listen("tcp", srv)
-	must(err)
-	fmt.Println("Waiting for remote connection on", srv)
-	conn, err := ln.Accept()
-	must(err)
-	defer conn.Close()
-	// Send offer SDP (base64 encoded with newline termination)
-	offerEncoded := base64.StdEncoding.EncodeToString([]byte(pc.LocalDescription().SDP))
-	_, err = fmt.Fprintf(conn, "%s\n", offerEncoded)
-	must(err)
-	// Read answer SDP
-	answerEncoded, err := bufio.NewReader(conn).ReadString('\n')
-	must(err)
-	answerSDPBytes, err := base64.StdEncoding.DecodeString(answerEncoded[:len(answerEncoded)-1])
-	must(err)
-	must(pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: string(answerSDPBytes)}))
-}
-
-func runAnswer(pc *webrtc.PeerConnection, outPath string) {
-	var file *os.File
-
-	// Ensure output directory exists
-	dir := filepath.Dir(outPath)
-	if dir != "." && dir != "" {
-		must(os.MkdirAll(dir, 0755))
+// tryConnect now only dials if our PeerID is “less” than theirs, avoiding simultaneous dials.
+func tryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) {
+	if pi.ID == h.ID() {
+		return
 	}
 
-	// 2. Listen for DataChannel
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		dc.OnOpen(func() {
-			fmt.Println("DataChannel open, ready to receive file...")
-			var err error
-			file, err = os.Create(outPath)
-			must(err)
-		})
-
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			_, err := file.Write(msg.Data)
-			must(err)
-		})
-
-		dc.OnClose(func() {
-			file.Sync()
-			file.Close()
-			fmt.Println("File received and saved to", outPath)
-			pc.Close()
-			os.Exit(0)
-		})
-	})
-
-	// Signaling
-	offerSDP := readSDPFromStdin("OFFER")
-	must(pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offerSDP}))
-
-	answer, err := pc.CreateAnswer(nil)
-	must(err)
-	must(pc.SetLocalDescription(answer))
-	<-webrtc.GatheringCompletePromise(pc)
-
-	printSDP("ANSWER", pc.LocalDescription().SDP)
-}
-
-// New function: automatic signaling for the answer role.
-func runAnswerAuto(pc *webrtc.PeerConnection, outPath, srv string) {
-	// Ensure output directory exists
-	dir := filepath.Dir(outPath)
-	if dir != "." && dir != "" {
-		must(os.MkdirAll(dir, 0755))
+	// tie-breaker: only dial if our ID is lexicographically smaller
+	if h.ID().String() >= pi.ID.String() {
+		return
 	}
 
-	// DataChannel handler as in runAnswer
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		var file *os.File
-		dc.OnOpen(func() {
-			fmt.Println("DataChannel open, ready to receive file...")
-			var err error
-			file, err = os.Create(outPath)
-			must(err)
-		})
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			_, err := file.Write(msg.Data)
-			must(err)
-		})
-		dc.OnClose(func() {
-			file.Sync()
-			file.Close()
-			fmt.Println("File received and saved to", outPath)
-			pc.Close()
-			os.Exit(0)
-		})
-	})
+	// add discovered addresses to the peerstore for 1 hour
+	h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
 
-	// Dial to the offer's signaling address
-	conn, err := net.Dial("tcp", srv)
-	must(err)
-	defer conn.Close()
-	// Read offer SDP
-	offerEncoded, err := bufio.NewReader(conn).ReadString('\n')
-	must(err)
-	offerSDPBytes, err := base64.StdEncoding.DecodeString(offerEncoded[:len(offerEncoded)-1])
-	must(err)
-	must(pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: string(offerSDPBytes)}))
+	fmt.Println("🔍 Dialing", pi.ID, "…")
+	ctxC, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-	answer, err := pc.CreateAnswer(nil)
-	must(err)
-	must(pc.SetLocalDescription(answer))
-	<-webrtc.GatheringCompletePromise(pc)
+	if err := h.Connect(ctxC, pi); err != nil {
+		fmt.Println("🔗 Dial error for", pi.ID, ":", err)
+		go retryConnect(ctx, h, pi, pid)
+		return
+	}
 
-	// Send answer SDP
-	answerEncoded := base64.StdEncoding.EncodeToString([]byte(pc.LocalDescription().SDP))
-	_, err = fmt.Fprintf(conn, "%s\n", answerEncoded)
-	must(err)
+	// open our protocol stream
+	stream, err := h.NewStream(ctx, pi.ID, protocol.ID(pid))
+	if err != nil {
+		fmt.Println("🔗 Stream open failed for", pi.ID, ":", err)
+		go retryConnect(ctx, h, pi, pid)
+		return
+	}
+
+	fmt.Println("🔗 Connected & stream open to", pi.ID)
+	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+	peersMu.Lock()
+	peers = append(peers, rw)
+	peersMu.Unlock()
+
+	go readData(rw)
 }
 
-func sendFile(dc *webrtc.DataChannel, path string) {
-	f, err := os.Open(path)
-	must(err)
-	defer f.Close()
+// retryConnect waits and then re-attempts dialing (still honoring the tie-breaker).
+func retryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) {
+	time.Sleep(5 * time.Second)
 
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := f.Read(buf)
-		if err == io.EOF {
+	// if already connected, skip it
+	for _, c := range h.Network().Conns() {
+		if c.RemotePeer() == pi.ID {
+			fmt.Println("✅ Already connected to", pi.ID)
+			return
+		}
+	}
+
+	fmt.Println("🔄 Retrying dial to", pi.ID)
+	tryConnect(ctx, h, pi, pid)
+}
+
+// New function to remove a peer from the peers slice.
+func removePeer(rw *bufio.ReadWriter) {
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	for i, peerRW := range peers {
+		if peerRW == rw {
+			// Remove the peer at index i
+			peers = append(peers[:i], peers[i+1:]...)
 			break
 		}
-		must(err)
-		must(dc.Send(buf[:n]))
-		// slight pause to avoid buffer overflow in slow links
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// printSDP encodes the SDP in base64 and prints with headers
-func printSDP(label, sdp string) {
-	raw := base64.StdEncoding.EncodeToString([]byte(sdp))
-	fmt.Printf("-----%s-----\n%s\n-----%s-----\n", label, raw, label)
+func readData(rw *bufio.ReadWriter) {
+	for {
+		msg, err := rw.ReadString('\n')
+		if err != nil {
+			removePeer(rw)
+			return
+		}
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			continue
+		}
+		parts := strings.SplitN(msg, ":", 3)
+		switch parts[0] {
+		case "FILE":
+			if len(parts) != 3 {
+				fmt.Println("❌ Invalid FILE message format")
+				continue
+			}
+			filename := parts[1]
+			rawData, err := base64.StdEncoding.DecodeString(parts[2])
+			if err != nil {
+				fmt.Printf("❌ Failed to decode file %s: %s\n", filename, err)
+				continue
+			}
+			outputDir := "./output"
+			os.MkdirAll(outputDir, os.ModePerm)
+			outputPath := filepath.Join(outputDir, filename)
+			if err := os.WriteFile(outputPath, rawData, 0644); err != nil {
+				fmt.Printf("❌ Failed to save \"%s\": %s\n", filename, err)
+			} else {
+				fmt.Printf("📄 Received file \"%s\" → %s\n", filename, outputPath)
+			}
+		case "CODE":
+			if len(parts) != 3 {
+				fmt.Println("❌ Invalid CODE message format")
+				continue
+			}
+			// parts[1] can be "filename|lang", e.g. "main.go|go"
+			meta := strings.SplitN(parts[1], "|", 2)
+			filename := meta[0]
+			lang := "txt"
+			if len(meta) == 2 {
+				lang = meta[1]
+			}
+			rawCode, err := base64.StdEncoding.DecodeString(parts[2])
+			if err != nil {
+				fmt.Printf("❌ Failed to decode code %s: %s\n", filename, err)
+				continue
+			}
+			outputDir := "./output"
+			os.MkdirAll(outputDir, os.ModePerm)
+			outputPath := filepath.Join(outputDir, filename)
+			if err := os.WriteFile(outputPath, rawCode, 0644); err != nil {
+				fmt.Printf("❌ Failed to save code \"%s\": %s\n", filename, err)
+			} else {
+				fmt.Printf("🖥️ Code \"%s\" (lang=%s) → %s\n", filename, lang, outputPath)
+			}
+		default:
+			// normal chat
+			fmt.Printf("\n\x1b[32m%s\x1b[0m ▷ ", msg)
+		}
+	}
 }
 
-// readSDPFromStdin reads base64 SDP from stdin between headers
-func readSDPFromStdin(label string) string {
-	r := bufio.NewReader(os.Stdin)
-	fmt.Printf("Paste %s SDP (base64) and hit enter:\n", label)
-	line, err := r.ReadString('\n')
-	must(err)
-	decoded, err := base64.StdEncoding.DecodeString(line)
-	must(err)
-	return string(decoded)
+// New function to continuously read console input and broadcast messages.
+func readConsole() {
+	stdin := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("💬 ")
+		input, err := stdin.ReadString('\n')
+		if err != nil {
+			return
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+
+		var toSend string
+		switch {
+		case strings.HasPrefix(input, "/share "):
+			filename := strings.TrimSpace(strings.TrimPrefix(input, "/share "))
+			data, err := os.ReadFile(filename)
+			if err != nil {
+				fmt.Println("Error reading file:", err)
+				continue
+			}
+			encoded := base64.StdEncoding.EncodeToString(data)
+			toSend = fmt.Sprintf("FILE:%s:%s", filepath.Base(filename), encoded)
+
+		case strings.HasPrefix(input, "/code "):
+			// usage: /code <filename> [lang]
+			parts := strings.Fields(input)
+			if len(parts) < 2 {
+				fmt.Println("Usage: /code <filename> [language]")
+				continue
+			}
+			filename := parts[1]
+			lang := "txt"
+			if len(parts) >= 3 {
+				lang = parts[2]
+			}
+			data, err := os.ReadFile(filename)
+			if err != nil {
+				fmt.Println("Error reading file:", err)
+				continue
+			}
+			encoded := base64.StdEncoding.EncodeToString(data)
+			// embed language after a pipe
+			toSend = fmt.Sprintf("CODE:%s|%s:%s", filepath.Base(filename), lang, encoded)
+
+		default:
+			toSend = input
+		}
+
+		broadcastMessage(toSend)
+	}
+}
+
+// Function to broadcast a message to all connected peers.
+func broadcastMessage(message string) {
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	for _, rw := range peers {
+		if _, err := rw.WriteString(message + "\n"); err != nil {
+			removePeer(rw)
+			continue
+		}
+		rw.Flush()
+	}
+}
+
+type addrList []maddr.Multiaddr
+
+func (al *addrList) String() string {
+	var out []string
+	for _, addr := range *al {
+		out = append(out, addr.String())
+	}
+	return strings.Join(out, ",")
+}
+
+func (al *addrList) Set(value string) error {
+	addr, err := maddr.NewMultiaddr(value)
+	if err != nil {
+		return err
+	}
+	*al = append(*al, addr)
+	return nil
+}
+
+type Config struct {
+	RendezvousString string
+	ListenAddresses  addrList
+	ProtocolID       string
+}
+
+func ParseFlags() (Config, error) {
+	var config Config
+	flag.StringVar(&config.RendezvousString, "rendezvous", "chatroom", "Unique string to identify peer group")
+	flag.Var(&config.ListenAddresses, "listen", "Multiaddress to listen on")
+	flag.StringVar(&config.ProtocolID, "pid", "/chat/1.1.0", "Protocol ID for streams")
+	flag.Parse()
+
+	if len(config.ListenAddresses) == 0 {
+		addr, _ := maddr.NewMultiaddr("/ip4/0.0.0.0/tcp/0")
+		config.ListenAddresses = append(config.ListenAddresses, addr)
+	}
+
+	return config, nil
+}
+
+type mdnsNotifee struct {
+	PeerChan chan peer.AddrInfo
+}
+
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Debug: log discovered peer via mDNS.
+	fmt.Println("👀 Discovered via mdns:", pi.ID)
+	n.PeerChan <- pi
+}
+
+func initMDNS(h host.Host, rendezvous string) chan peer.AddrInfo {
+	peerChan := make(chan peer.AddrInfo)
+	notifee := &mdnsNotifee{PeerChan: peerChan}
+	service := mdns.NewMdnsService(h, rendezvous, notifee)
+	if err := service.Start(); err != nil {
+		panic(err)
+	}
+	return peerChan
 }

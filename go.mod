@@ -1,21 +1,15 @@
 module github.com/oarkflow/dag
 
-go 1.24.1
-
-toolchain go1.24.2
+go 1.24.2
 
 require (
-	github.com/PuerkitoBio/goquery v1.10.2
-	github.com/dop251/goja v0.0.0-20250309171923-bcd7cc6bf64c
 	github.com/google/uuid v1.6.0
 	github.com/libp2p/go-libp2p v0.41.1
-	github.com/libp2p/go-libp2p-discovery v0.7.0
 	github.com/libp2p/go-libp2p-kad-dht v0.33.1
 	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
 	github.com/maruel/rs v1.1.0
 	github.com/pion/webrtc/v3 v3.3.5
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
-	github.com/tdewolff/parse v2.3.4+incompatible
 	golang.org/x/time v0.11.0
 	gopkg.in/yaml.v2 v2.4.0
 )
@@ -53,7 +47,6 @@ require (
 )
 
 require (
-	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -62,12 +55,10 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
-	github.com/dlclark/regexp2 v1.11.4 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/elastic/gosigar v0.14.3 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
 	github.com/francoispqt/gojay v1.2.13 // indirect
-	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/gofiber/fiber/v2 v2.52.6
@@ -77,7 +68,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/ipfs/go-cid v0.5.0 // indirect
-	github.com/ipfs/go-log/v2 v2.6.0 // indirect
+	github.com/ipfs/go-log/v2 v2.6.0
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
@@ -86,8 +77,6 @@ require (
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.3.0 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
-	github.com/libp2p/go-libp2p-core v0.20.1
-	github.com/libp2p/go-libp2p-noise v0.5.0
 	github.com/libp2p/go-libp2p-pubsub v0.13.1
 	github.com/libp2p/go-msgio v0.3.0 // indirect
 	github.com/libp2p/go-netroute v0.2.2 // indirect
@@ -102,7 +91,7 @@ require (
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
-	github.com/multiformats/go-multiaddr v0.15.0 // indirect
+	github.com/multiformats/go-multiaddr v0.15.0
 	github.com/multiformats/go-multiaddr-dns v0.4.1 // indirect
 	github.com/multiformats/go-multiaddr-fmt v0.1.0 // indirect
 	github.com/multiformats/go-multibase v0.2.0 // indirect
@@ -149,7 +138,6 @@ require (
 	github.com/raulk/go-watchdog v1.3.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
-	github.com/tdewolff/test v1.0.11 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/wlynxg/anet v0.0.5 // indirect
 	go.uber.org/dig v1.19.0 // indirect
