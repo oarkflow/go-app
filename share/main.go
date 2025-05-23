@@ -114,6 +114,8 @@ func main() {
 
 	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
 	dutil.Advertise(ctx, routingDiscovery, config.RendezvousString)
+	// Wait to allow advertisement to propagate across networks.
+	time.Sleep(10 * time.Second)
 
 	dhtChan, err := routingDiscovery.FindPeers(ctx, config.RendezvousString)
 	if err != nil {
@@ -155,11 +157,6 @@ func tryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) 
 		return
 	}
 
-	// tie-breaker: only dial if our ID is lexicographically smaller
-	if h.ID().String() >= pi.ID.String() {
-		return
-	}
-
 	// add discovered addresses to the peerstore for 1 hour
 	h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
 
@@ -168,6 +165,11 @@ func tryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) 
 	defer cancel()
 
 	if err := h.Connect(ctxC, pi); err != nil {
+		// If error is due to noise handshake failures, don't retry.
+		if strings.Contains(err.Error(), "noise: message is too short") {
+			fmt.Println("🔗 Security handshake failed for", pi.ID, ":", err)
+			return
+		}
 		fmt.Println("🔗 Dial error for", pi.ID, ":", err)
 		go retryConnect(ctx, h, pi, pid)
 		return
@@ -392,7 +394,7 @@ type Config struct {
 
 func ParseFlags() (Config, error) {
 	var config Config
-	flag.StringVar(&config.RendezvousString, "rendezvous", "chatroom", "Unique string to identify peer group")
+	flag.StringVar(&config.RendezvousString, "rendezvous", "oarkflow-chat", "Unique string to identify peer group")
 	flag.Var(&config.ListenAddresses, "listen", "Multiaddress to listen on")
 	flag.StringVar(&config.ProtocolID, "pid", "/chat/1.1.0", "Protocol ID for streams")
 	flag.StringVar(&config.Alias, "alias", "", "Alias for chat. If empty, uses PeerID")
