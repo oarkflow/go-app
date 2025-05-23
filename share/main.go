@@ -29,6 +29,10 @@ import (
 
 var logger = logging.Logger("chat")
 
+// Add global variable to hold our own PeerID and alias.
+var selfID string
+var selfAlias string
+
 // Add global peers slice to manage active streams.
 var (
 	peersMu sync.Mutex
@@ -65,6 +69,12 @@ func main() {
 	host.SetStreamHandler(protocol.ID(config.ProtocolID), handleStream)
 
 	fmt.Printf("Your Peer ID: %s\n", host.ID())
+	selfID = host.ID().String() // assign global selfID
+	if config.Alias != "" {
+		selfAlias = config.Alias
+	} else {
+		selfAlias = selfID
+	}
 	for _, addr := range host.Addrs() {
 		fmt.Printf(" - %s/p2p/%s\n", addr, host.ID())
 	}
@@ -109,6 +119,7 @@ func main() {
 
 func handleStream(stream network.Stream) {
 	fmt.Println("📡 Incoming stream from", stream.Conn().RemotePeer())
+	fmt.Print("💬 ")
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
 	// Register the new stream.
 	peersMu.Lock()
@@ -150,6 +161,7 @@ func tryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) 
 	}
 
 	fmt.Println("🔗 Connected & stream open to", pi.ID)
+	fmt.Print("💬 ")
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
 
 	peersMu.Lock()
@@ -246,8 +258,16 @@ func readData(rw *bufio.ReadWriter) {
 				fmt.Printf("🖥️ Code \"%s\" (lang=%s) → %s\n", filename, lang, outputPath)
 			}
 		default:
-			// normal chat
-			fmt.Printf("\n\x1b[32m%s\x1b[0m ▷ ", msg)
+			// For plain chat messages, extract the sender's PeerID.
+			// expected format: "PeerID: message"
+			splitMsg := strings.SplitN(msg, ": ", 2)
+			sender, content := "unknown", msg
+			if len(splitMsg) == 2 {
+				sender = splitMsg[0]
+				content = splitMsg[1]
+			}
+			fmt.Printf("\n\x1b[32m%s\x1b[0m ▷ %s\n", sender, content)
+			fmt.Print("💬 ")
 		}
 	}
 }
@@ -300,7 +320,8 @@ func readConsole() {
 			toSend = fmt.Sprintf("CODE:%s|%s:%s", filepath.Base(filename), lang, encoded)
 
 		default:
-			toSend = input
+			// Prefix plain chat messages with selfAlias.
+			toSend = fmt.Sprintf("%s: %s", selfAlias, input)
 		}
 
 		broadcastMessage(toSend)
@@ -343,6 +364,7 @@ type Config struct {
 	RendezvousString string
 	ListenAddresses  addrList
 	ProtocolID       string
+	Alias            string // new field for alias
 }
 
 func ParseFlags() (Config, error) {
@@ -350,6 +372,7 @@ func ParseFlags() (Config, error) {
 	flag.StringVar(&config.RendezvousString, "rendezvous", "chatroom", "Unique string to identify peer group")
 	flag.Var(&config.ListenAddresses, "listen", "Multiaddress to listen on")
 	flag.StringVar(&config.ProtocolID, "pid", "/chat/1.1.0", "Protocol ID for streams")
+	flag.StringVar(&config.Alias, "alias", "", "Alias for chat. If empty, uses PeerID")
 	flag.Parse()
 
 	if len(config.ListenAddresses) == 0 {
