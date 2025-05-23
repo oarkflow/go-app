@@ -117,63 +117,62 @@ func handleStream(stream network.Stream) {
 	go readData(rw)
 }
 
-func tryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid string) {
-	if peerInfo.ID == h.ID() {
+// tryConnect now only dials if our PeerID is “less” than theirs, avoiding simultaneous dials.
+func tryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) {
+	if pi.ID == h.ID() {
 		return
 	}
-	// Check for reachable addresses.
-	if len(peerInfo.Addrs) == 0 {
-		fmt.Println("⚠️ No addresses for", peerInfo.ID, "- skipping connection")
+
+	// tie-breaker: only dial if our ID is lexicographically smaller
+	if h.ID().String() >= pi.ID.String() {
 		return
 	}
-	fmt.Println("🔍 Attempting connection to", peerInfo.ID, "with addrs:", peerInfo.Addrs)
-	// If already connected, skip dialing.
-	connected := false
-	for _, conn := range h.Network().Conns() {
-		if conn.RemotePeer() == peerInfo.ID {
-			connected = true
-			break
-		}
+
+	// add discovered addresses to the peerstore for 1 hour
+	h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+
+	fmt.Println("🔍 Dialing", pi.ID, "…")
+	ctxC, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := h.Connect(ctxC, pi); err != nil {
+		fmt.Println("🔗 Dial error for", pi.ID, ":", err)
+		go retryConnect(ctx, h, pi, pid)
+		return
 	}
-	if !connected {
-		ctxConnect, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := h.Connect(ctxConnect, peerInfo); err != nil {
-			fmt.Println("🔗 Connection failed for", peerInfo.ID, "error:", err)
-			go retryConnect(ctx, h, peerInfo, pid)
-			return
-		}
-	}
-	stream, err := h.NewStream(ctx, peerInfo.ID, protocol.ID(pid))
+
+	// open our protocol stream
+	stream, err := h.NewStream(ctx, pi.ID, protocol.ID(pid))
 	if err != nil {
-		fmt.Println("🔗 Stream open failed for", peerInfo.ID, "error:", err)
-		go retryConnect(ctx, h, peerInfo, pid)
+		fmt.Println("🔗 Stream open failed for", pi.ID, ":", err)
+		go retryConnect(ctx, h, pi, pid)
 		return
 	}
+
+	fmt.Println("🔗 Connected & stream open to", pi.ID)
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
 	peersMu.Lock()
 	peers = append(peers, rw)
 	peersMu.Unlock()
+
 	go readData(rw)
 }
 
-// New function to retry connection if not already connected.
-func retryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid string) {
+// retryConnect waits and then re-attempts dialing (still honoring the tie-breaker).
+func retryConnect(ctx context.Context, h host.Host, pi peer.AddrInfo, pid string) {
 	time.Sleep(5 * time.Second)
-	// Check if already connected to the specific peer.
-	connected := false
-	for _, conn := range h.Network().Conns() {
-		if conn.RemotePeer() == peerInfo.ID {
-			connected = true
-			break
+
+	// if already connected, skip it
+	for _, c := range h.Network().Conns() {
+		if c.RemotePeer() == pi.ID {
+			fmt.Println("✅ Already connected to", pi.ID)
+			return
 		}
 	}
-	if connected {
-		fmt.Println("✅ Already connected to", peerInfo.ID)
-		return
-	}
-	fmt.Println("🔄 Retrying connection to", peerInfo.ID)
-	tryConnect(ctx, h, peerInfo, pid)
+
+	fmt.Println("🔄 Retrying dial to", pi.ID)
+	tryConnect(ctx, h, pi, pid)
 }
 
 // New function to remove a peer from the peers slice.
