@@ -1,0 +1,8 @@
+{
+  "LatinToIPA": {
+    "a": "æ", "b": "b", "c": "k"
+  },
+  "CyrillicToLatin": {
+    "А": "A", "Б": "B", "В": "V"
+  }
+}

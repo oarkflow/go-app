@@ -1,0 +1,3 @@
+not	-1
+never	-1
+no	-1

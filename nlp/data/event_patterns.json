@@ -1,0 +1,5 @@
+{
+  "patterns": [
+    {"regex": "(\\b[A-Z][a-z]+\\b) (went to|visited|traveled to) (\\b[A-Z][a-z]+\\b|\\d{4}-\\d{2}-\\d{2})", "slots": ["entity1","verb","entity2_or_date"]}
+  ]
+}

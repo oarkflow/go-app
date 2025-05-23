@@ -13,14 +13,16 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-
+	disc "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -782,4 +784,59 @@ func processSDPAnswerFull(answerCode, encodedAnswer string) {
 		fmt.Printf("[WebRTC] WebRTC connection established for offer %s!\n", oc)
 		break
 	}
+}
+
+func joinMode(code string) {
+	ctx := context.Background()
+	// 1) create libp2p host with same options...
+	h, err := libp2p.New( /* ...existing options... */ )
+	if err != nil {
+		log.Fatal(err)
+	}
+	// 2) set up DHT + bootstrap
+	kDHT, err := dht.New(ctx, h)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, pi := range dht.GetDefaultBootstrapPeerAddrInfos() {
+		if err := h.Connect(ctx, pi); err != nil {
+			log.Printf("warning: bootstrap connect failed: %v", err)
+		}
+	}
+	if err := kDHT.Bootstrap(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	// 3) discover the host via DHT
+	rendezvous := rendezvousPrefix + code
+	routing := disc.NewRoutingDiscovery(kDHT)
+	peerCh, err := routing.FindPeers(ctx, rendezvous)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var pi peer.AddrInfo
+	for {
+		select {
+		case p := <-peerCh:
+			// Skip ourselves and peers with no addresses.
+			if p.ID == h.ID() || len(p.Addrs()) == 0 {
+				continue
+			}
+			pi = p
+			break
+		case <-time.After(30 * time.Second):
+			log.Fatal("timed out finding peer")
+		}
+		if pi.ID != "" {
+			break
+		}
+	}
+
+	// 4) connect to host
+	if err := h.Connect(ctx, pi); err != nil {
+		log.Fatalf("connect failed: %v", err)
+	}
+	fmt.Println("Connected to host:", pi.ID)
+	// ...existing code...
 }

@@ -1,0 +1,8 @@
+{
+  "subject_verb_agreement": [
+    {"pattern": "(\\b[Ii]s)\\s+[A-Za-z]+s\\b", "suggestion": "Use singular verb for singular subject"}
+  ],
+  "dangling_modifiers": [
+    {"pattern": "^(\\w+ing\\s+\\w+),", "suggestion": "Ensure the modifier attaches to a clear subject"}
+  ]
+}
