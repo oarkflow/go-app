@@ -57,12 +57,17 @@ func main() {
 		panic(err)
 	}
 
+	// Convert static relay multiaddresses to []peer.AddrInfo.
+	staticRelays := getStaticRelayPeers()
+
 	host, err := libp2p.New(
 		libp2p.Identity(priv), // ensure persistent identity
 		libp2p.ListenAddrs(config.ListenAddresses...),
 		libp2p.Security(noise.ID, noise.New),
 		// Added NAT port mapping for traversal across networks
 		libp2p.NATPortMap(),
+		// Enable auto relay with static relays for devices behind strict NAT.
+		libp2p.EnableAutoRelayWithStaticRelays(staticRelays),
 	)
 	if err != nil {
 		panic(err)
@@ -403,4 +408,25 @@ func initMDNS(h host.Host, rendezvous string) chan peer.AddrInfo {
 		panic(err)
 	}
 	return peerChan
+}
+
+// getStaticRelayPeers converts static relay multiaddresses into []peer.AddrInfo.
+func getStaticRelayPeers() []peer.AddrInfo {
+	var peersInfo []peer.AddrInfo
+	addrStrs := []string{
+		"/ip4/1.2.3.4/tcp/4001/p2p/QmRelayPeerID1",
+		"/ip4/5.6.7.8/tcp/4001/p2p/QmRelayPeerID2",
+	}
+	for _, s := range addrStrs {
+		maddr, err := maddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pi, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			continue
+		}
+		peersInfo = append(peersInfo, *pi)
+	}
+	return peersInfo
 }
