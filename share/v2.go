@@ -3,15 +3,19 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	logging "github.com/ipfs/go-log/v2"
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -42,7 +46,15 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	// Create a persistent identity for a consistent PeerID.
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 2048)
+	if err != nil {
+		panic(err)
+	}
+
 	host, err := libp2p.New(
+		libp2p.Identity(priv), // ensure persistent identity
 		libp2p.ListenAddrs(config.ListenAddresses...),
 		libp2p.Security(noise.ID, noise.New),
 	)
@@ -109,21 +121,26 @@ func tryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid st
 	if peerInfo.ID == h.ID() {
 		return
 	}
-	if err := h.Connect(ctx, peerInfo); err != nil {
+	// Debug: log connection attempt with addresses.
+	fmt.Println("🔍 Attempting connection to", peerInfo.ID, "with addrs:", peerInfo.Addrs)
+	// Use a timeout for connection attempts.
+	ctxConnect, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := h.Connect(ctxConnect, peerInfo); err != nil {
 		if strings.Contains(err.Error(), "noise: message is too short") {
 			// Quietly ignore noise handshake errors.
 			return
 		}
-		// Minimal log for other errors.
-		fmt.Println("🔗 Connection skipped for", peerInfo.ID)
+		// Log connection failure.
+		fmt.Println("🔗 Connection skipped for", peerInfo.ID, "error:", err)
 		return
 	}
 	fmt.Println("🔗 Connected to", peerInfo.ID)
 
 	stream, err := h.NewStream(ctx, peerInfo.ID, protocol.ID(pid))
 	if err != nil {
-		// Minimal error output.
-		fmt.Println("🔗 Stream open failed:", err)
+		// Log stream open failure.
+		fmt.Println("🔗 Stream open failed for", peerInfo.ID, "error:", err)
 		return
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
@@ -134,38 +151,78 @@ func tryConnect(ctx context.Context, h host.Host, peerInfo peer.AddrInfo, pid st
 	go readData(rw)
 }
 
+// New function to remove a peer from the peers slice.
+func removePeer(rw *bufio.ReadWriter) {
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	for i, peerRW := range peers {
+		if peerRW == rw {
+			// Remove the peer at index i
+			peers = append(peers[:i], peers[i+1:]...)
+			break
+		}
+	}
+}
+
 func readData(rw *bufio.ReadWriter) {
 	for {
 		msg, err := rw.ReadString('\n')
 		if err != nil {
+			removePeer(rw)
 			return
 		}
 		msg = strings.TrimSpace(msg)
 		if msg == "" {
 			continue
 		}
-		if strings.HasPrefix(msg, "FILE:") {
-			parts := strings.SplitN(msg, "\n", 2)
-			filename := strings.TrimPrefix(parts[0], "FILE:")
-			fileContent := ""
-			if len(parts) > 1 {
-				fileContent = parts[1]
+		parts := strings.SplitN(msg, ":", 3)
+		switch parts[0] {
+		case "FILE":
+			if len(parts) != 3 {
+				fmt.Println("❌ Invalid FILE message format")
+				continue
 			}
-			fmt.Printf("\n📄 Received file \"%s\":\n%s\n", filename, fileContent)
-		} else if strings.HasPrefix(msg, "CODE:") {
-			parts := strings.SplitN(msg, "\n", 3)
-			filename := strings.TrimPrefix(parts[0], "CODE:")
-			language := "go"
-			codeContent := ""
-			if len(parts) >= 3 {
-				if parts[1] != "" {
-					language = parts[1]
-				}
-				codeContent = parts[2]
+			filename := parts[1]
+			rawData, err := base64.StdEncoding.DecodeString(parts[2])
+			if err != nil {
+				fmt.Printf("❌ Failed to decode file %s: %s\n", filename, err)
+				continue
 			}
-			fmt.Printf("\n🖥️ Code received for \"%s\" [%s]:\n%s\n", filename, language, codeContent)
-		} else {
-			// Print regular chat message with a colored prompt.
+			outputDir := "./output"
+			os.MkdirAll(outputDir, os.ModePerm)
+			outputPath := filepath.Join(outputDir, filename)
+			if err := os.WriteFile(outputPath, rawData, 0644); err != nil {
+				fmt.Printf("❌ Failed to save \"%s\": %s\n", filename, err)
+			} else {
+				fmt.Printf("📄 Received file \"%s\" → %s\n", filename, outputPath)
+			}
+		case "CODE":
+			if len(parts) != 3 {
+				fmt.Println("❌ Invalid CODE message format")
+				continue
+			}
+			// parts[1] can be "filename|lang", e.g. "main.go|go"
+			meta := strings.SplitN(parts[1], "|", 2)
+			filename := meta[0]
+			lang := "txt"
+			if len(meta) == 2 {
+				lang = meta[1]
+			}
+			rawCode, err := base64.StdEncoding.DecodeString(parts[2])
+			if err != nil {
+				fmt.Printf("❌ Failed to decode code %s: %s\n", filename, err)
+				continue
+			}
+			outputDir := "./output"
+			os.MkdirAll(outputDir, os.ModePerm)
+			outputPath := filepath.Join(outputDir, filename)
+			if err := os.WriteFile(outputPath, rawCode, 0644); err != nil {
+				fmt.Printf("❌ Failed to save code \"%s\": %s\n", filename, err)
+			} else {
+				fmt.Printf("🖥️ Code \"%s\" (lang=%s) → %s\n", filename, lang, outputPath)
+			}
+		default:
+			// normal chat
 			fmt.Printf("\n\x1b[32m%s\x1b[0m ▷ ", msg)
 		}
 	}
@@ -184,39 +241,45 @@ func readConsole() {
 		if input == "" {
 			continue
 		}
-		// Process commands for file or code sharing.
-		if strings.HasPrefix(input, "/share ") {
-			parts := strings.SplitN(input, " ", 2)
-			if len(parts) < 2 {
-				fmt.Println("Usage: /share <filename>")
-				continue
-			}
-			filename := parts[1]
+
+		var toSend string
+		switch {
+		case strings.HasPrefix(input, "/share "):
+			filename := strings.TrimSpace(strings.TrimPrefix(input, "/share "))
 			data, err := os.ReadFile(filename)
 			if err != nil {
 				fmt.Println("Error reading file:", err)
 				continue
 			}
-			input = fmt.Sprintf("FILE:%s\n%s", filename, string(data))
-		} else if strings.HasPrefix(input, "/code ") {
-			parts := strings.SplitN(input, " ", 3)
+			encoded := base64.StdEncoding.EncodeToString(data)
+			toSend = fmt.Sprintf("FILE:%s:%s", filepath.Base(filename), encoded)
+
+		case strings.HasPrefix(input, "/code "):
+			// usage: /code <filename> [lang]
+			parts := strings.Fields(input)
 			if len(parts) < 2 {
 				fmt.Println("Usage: /code <filename> [language]")
 				continue
 			}
 			filename := parts[1]
-			language := "go"
-			if len(parts) == 3 && parts[2] != "" {
-				language = parts[2]
+			lang := "txt"
+			if len(parts) >= 3 {
+				lang = parts[2]
 			}
 			data, err := os.ReadFile(filename)
 			if err != nil {
 				fmt.Println("Error reading file:", err)
 				continue
 			}
-			input = fmt.Sprintf("CODE:%s\n%s\n%s", filename, language, string(data))
+			encoded := base64.StdEncoding.EncodeToString(data)
+			// embed language after a pipe
+			toSend = fmt.Sprintf("CODE:%s|%s:%s", filepath.Base(filename), lang, encoded)
+
+		default:
+			toSend = input
 		}
-		broadcastMessage(input)
+
+		broadcastMessage(toSend)
 	}
 }
 
@@ -225,10 +288,11 @@ func broadcastMessage(message string) {
 	peersMu.Lock()
 	defer peersMu.Unlock()
 	for _, rw := range peers {
-		_, err := rw.WriteString(message + "\n")
-		if err == nil {
-			rw.Flush()
+		if _, err := rw.WriteString(message + "\n"); err != nil {
+			removePeer(rw)
+			continue
 		}
+		rw.Flush()
 	}
 }
 
@@ -277,6 +341,8 @@ type mdnsNotifee struct {
 }
 
 func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Debug: log discovered peer via mDNS.
+	fmt.Println("👀 Discovered via mdns:", pi.ID)
 	n.PeerChan <- pi
 }
 
