@@ -89,6 +89,20 @@ func main() {
 	// Start mDNS
 	mdnsChan := initMDNS(host, config.RendezvousString)
 
+	// Before starting the DHT, connect to global bootstrap peers.
+	bootstrapPeers := getBootstrapPeers(config.BootstrapPeers)
+	for _, bp := range bootstrapPeers {
+		if bp.ID == host.ID() {
+			continue
+		}
+		host.Peerstore().AddAddrs(bp.ID, bp.Addrs, time.Hour)
+		if err := host.Connect(ctx, bp); err != nil {
+			fmt.Printf("Error connecting to bootstrap peer %s: %s\n", bp.ID, err)
+		} else {
+			fmt.Printf("Connected to bootstrap peer %s\n", bp.ID)
+		}
+	}
+
 	// Start DHT
 	kademliaDHT, err := dht.New(ctx, host)
 	if err != nil {
@@ -367,11 +381,13 @@ func (al *addrList) Set(value string) error {
 	return nil
 }
 
+// Update Config to include bootstrap addresses.
 type Config struct {
 	RendezvousString string
 	ListenAddresses  addrList
 	ProtocolID       string
-	Alias            string // new field for alias
+	Alias            string   // new field for alias
+	BootstrapPeers   []string // new field for bootstrap addresses, provided via flag
 }
 
 func ParseFlags() (Config, error) {
@@ -380,7 +396,15 @@ func ParseFlags() (Config, error) {
 	flag.Var(&config.ListenAddresses, "listen", "Multiaddress to listen on")
 	flag.StringVar(&config.ProtocolID, "pid", "/chat/1.1.0", "Protocol ID for streams")
 	flag.StringVar(&config.Alias, "alias", "", "Alias for chat. If empty, uses PeerID")
+	// New flag for bootstrap peers
+	var bootstrapPeersStr string
+	flag.StringVar(&bootstrapPeersStr, "bootstrap", "", "Comma-separated list of bootstrap peer multiaddresses")
 	flag.Parse()
+
+	// Split the bootstrap peers string into the config field
+	if bootstrapPeersStr != "" {
+		config.BootstrapPeers = strings.Split(bootstrapPeersStr, ",")
+	}
 
 	if len(config.ListenAddresses) == 0 {
 		addr, _ := maddr.NewMultiaddr("/ip4/0.0.0.0/tcp/0")
@@ -418,6 +442,27 @@ func getStaticRelayPeers() []peer.AddrInfo {
 		"/ip4/5.6.7.8/tcp/4001/p2p/QmRelayPeerID2",
 	}
 	for _, s := range addrStrs {
+		maddr, err := maddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pi, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			continue
+		}
+		peersInfo = append(peersInfo, *pi)
+	}
+	return peersInfo
+}
+
+// Replace the hard-coded getBootstrapPeers with a version that uses supplied addresses.
+func getBootstrapPeers(addrStrs []string) []peer.AddrInfo {
+	var peersInfo []peer.AddrInfo
+	for _, s := range addrStrs {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
 		maddr, err := maddr.NewMultiaddr(s)
 		if err != nil {
 			continue
