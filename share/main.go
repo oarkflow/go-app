@@ -61,6 +61,8 @@ func main() {
 		libp2p.Identity(priv), // ensure persistent identity
 		libp2p.ListenAddrs(config.ListenAddresses...),
 		libp2p.Security(noise.ID, noise.New),
+		// Added NAT port mapping for traversal across networks
+		libp2p.NATPortMap(),
 	)
 	if err != nil {
 		panic(err)
