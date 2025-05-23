@@ -1,0 +1,6 @@
+good	3
+bad	-3
+happy	2
+sad	-2
+enjoy	2
+terrible	-3

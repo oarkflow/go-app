@@ -1,0 +1,23 @@
+grammar:
+    rules_file: grammar_rules.json
+
+summarization:
+    config_file: summarization_config.json
+
+qa:
+    patterns_file: qa_patterns.json
+
+event:
+    patterns_file: event_patterns.json
+
+measurement:
+    units_file: measurement_units.json
+
+transliteration:
+    map_file: transliteration_map.json
+
+segmentation:
+    rules_file: segmentation_rules.json
+
+coref:
+    rules_file: coref_rules.json

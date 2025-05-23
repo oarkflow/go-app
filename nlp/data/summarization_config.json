@@ -1,0 +1,4 @@
+{
+  "max_sentences": 3,
+  "scoring": ["tfidf", "discourse"]
+}

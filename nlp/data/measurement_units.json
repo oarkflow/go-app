@@ -1,0 +1,13 @@
+{
+  "units": {
+    "kg": "kilogram",
+    "g": "gram",
+    "m": "meter",
+    "km": "kilometer"
+  },
+  "currency": {
+    "$": "USD",
+    "€": "EUR",
+    "¥": "JPY"
+  }
+}
