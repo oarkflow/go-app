@@ -3,7 +3,11 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +15,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,7 +24,6 @@ import (
 	"log/slog"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/gofiber/fiber/v2"
 	"github.com/joho/godotenv"
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,23 +35,31 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	envPath          = ".env"
-	graceTimeout     = 5 * time.Second
-	debounceDelay    = 500 * time.Millisecond
-	pidFile          = "/tmp/supervisor.pid"
-	healthPort       = "9999" // Metrics & health listen port
-	logFilePath      = "./log/myapp/supervisor.log"
-	childLogFilePath = "./log/myapp/child.log"
-	restartBackoff   = 1 * time.Second
-	maxBackoff       = 30 * time.Second
+	// Debounce delay for file events
+	debounceDelay = 500 * time.Millisecond
+	// Graceful shutdown timeout for child
+	graceTimeout = 5 * time.Second
 
-	// Crash-loop threshold: if more than this many crashes in the window, exit supervisor
+	// Crash-loop threshold: if child crashes > this within crashLoopWindow, exit
 	crashLoopThreshold = 5
 	crashLoopWindow    = 1 * time.Minute
+
+	// Prometheus & health endpoint port
+	healthPort = "9999"
+
+	// Log files
+	logFilePath      = "./log/myapp/supervisor.log"
+	childLogFilePath = "./log/myapp/child.log"
 )
 
+// CLI flags
 var (
-	// Prometheus metrics
+	cmdFlag = flag.String("cmd", "", "Command to run as child (e.g., 'go run app.go')")
+	envFlag = flag.String("env", ".env", "Path to .env file to load and watch")
+)
+
+// Prometheus metrics
+var (
 	restartCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "supervisor_restart_total",
@@ -69,14 +82,11 @@ var (
 )
 
 func init() {
-	// Register Prometheus metrics
 	prometheus.MustRegister(restartCounter, crashCounter, uptimeGauge)
 }
 
+// Supervisor manages the child process and watchers
 // ─────────────────────────────────────────────────────────────────────────────
-// Supervisor Struct
-// ─────────────────────────────────────────────────────────────────────────────
-
 type Supervisor struct {
 	cmdLock        sync.Mutex
 	currentCmd     *exec.Cmd
@@ -87,16 +97,24 @@ type Supervisor struct {
 	crashTimes     []time.Time
 	crashTimesLock sync.Mutex
 	startTime      time.Time
+
+	envPath      string            // path to .env from --env
+	childCommand string            // full command line from --cmd
+	lastEnvHash  string            // SHA256 of .env contents
+	lastOSEnv    map[string]string // snapshot of OS environment
 }
 
 func main() {
-	// If RUN_AS_CHILD=1 is set, act as the child worker
-	if os.Getenv("RUN_AS_CHILD") == "1" {
-		runWorker()
-		return
+	flag.Parse()
+
+	if *cmdFlag == "" {
+		fmt.Fprintln(os.Stderr, "Error: --cmd is required")
+		os.Exit(1)
 	}
 
-	// Supervisor mode
+	// Wrap the entire cmdFlag under /bin/sh -c so its children share the same PGID
+	childCmd := *cmdFlag
+
 	setupLogging()
 	checkOrCreatePIDFile()
 	defer removePIDFile()
@@ -106,17 +124,26 @@ func main() {
 	s := &Supervisor{
 		restartEvent: make(chan string, 1),
 		done:         make(chan struct{}),
-		backoff:      restartBackoff,
+		backoff:      1 * time.Second,
 		startTime:    time.Now(),
+		envPath:      *envFlag,
+		childCommand: childCmd,
+		lastOSEnv:    make(map[string]string),
 	}
 
+	// Compute initial .env hash and capture OS env
+	s.computeEnvHash()
+	s.captureOSEnv()
+
+	// Initialize fsnotify watcher
 	s.initWatcher()
 	defer s.watcher.Close()
 
-	// Begin watching .env and binary, and spawn monitor loop
-	go s.watchFiles()
-	go s.spawnAndMonitor()
-	go s.startMetricsServer()
+	// Start background tasks
+	go s.watchFiles()         // watch .env file, binary, AWS files
+	go s.watchEnvAndOSEnv()   // poll .env hash + OS env
+	go s.spawnAndMonitor()    // spawn & monitor child
+	go s.startMetricsServer() // /metrics + /healthz
 
 	// Handle signals: SIGHUP=reload, SIGINT/SIGTERM=shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -129,7 +156,7 @@ func main() {
 			case syscall.SIGHUP:
 				slog.Info("SIGHUP received: scheduling reload")
 				s.queueRestart("sighup")
-			default:
+			default: // SIGINT or SIGTERM
 				slog.Info("Shutdown signal received: tearing down child and exiting")
 				close(s.done)
 				s.killChild()
@@ -151,17 +178,13 @@ func setupLogging() {
 		fmt.Fprintf(os.Stderr, "Could not create log dir: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Rotating logger for supervisor
 	fileLogger := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    10, // megabytes
-		MaxBackups: 5,  // number of old log files to keep
+		MaxSize:    10, // MB
+		MaxBackups: 5,
 		MaxAge:     28, // days
 		Compress:   true,
 	}
-
-	// Composite: write to both stdout and file
 	mw := io.MultiWriter(os.Stdout, fileLogger)
 	handler := slog.NewTextHandler(mw, &slog.HandlerOptions{AddSource: false})
 	slog.SetDefault(slog.New(handler))
@@ -172,8 +195,10 @@ func setupLogging() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func checkOrCreatePIDFile() {
+	const pidFile = "/tmp/supervisor.pid"
 	if _, err := os.Stat(pidFile); err == nil {
-		slog.Error("PID file already exists; another instance may be running", slog.String("file", pidFile))
+		slog.Error("PID file already exists; another instance may be running",
+			slog.String("file", pidFile))
 		os.Exit(1)
 	}
 	pid := os.Getpid()
@@ -184,11 +209,11 @@ func checkOrCreatePIDFile() {
 }
 
 func removePIDFile() {
-	_ = os.Remove(pidFile)
+	_ = os.Remove("/tmp/supervisor.pid")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// File Watching (.env + binary)
+// File Watching (.env, supervisor binary, AWS config/credentials)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Supervisor) initWatcher() {
@@ -199,25 +224,63 @@ func (s *Supervisor) initWatcher() {
 		os.Exit(1)
 	}
 
-	bin, _ := os.Executable()
-	toWatch := []string{envPath, bin}
-	for _, file := range toWatch {
-		abs, _ := filepath.Abs(file)
+	// Watch the directory containing the configured .env
+	if abs, err := filepath.Abs(s.envPath); err == nil {
 		dir := filepath.Dir(abs)
 		if err := s.watcher.Add(dir); err != nil {
-			slog.Error("Failed to add watcher", slog.String("file", file), slog.String("err", err.Error()))
+			slog.Error("Failed to watch .env directory",
+				slog.String("dir", dir), slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-		slog.Info("Watching for changes", slog.String("path", abs))
+		slog.Info("Watching .env directory", slog.String("path", dir))
+	} else {
+		slog.Error("Unable to resolve .env path", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+
+	// Watch the directory containing this supervisor binary
+	if bin, err := os.Executable(); err == nil {
+		if abs, err := filepath.Abs(bin); err == nil {
+			dir := filepath.Dir(abs)
+			if err := s.watcher.Add(dir); err != nil {
+				slog.Error("Failed to watch binary directory",
+					slog.String("dir", dir), slog.String("err", err.Error()))
+				os.Exit(1)
+			}
+			slog.Info("Watching supervisor binary directory",
+				slog.String("path", dir))
+		}
+	}
+
+	// Watch AWS config/credentials (if they exist)
+	home := os.Getenv("HOME")
+	awsFiles := []string{
+		filepath.Join(home, ".aws", "config"),
+		filepath.Join(home, ".aws", "credentials"),
+	}
+	for _, f := range awsFiles {
+		if abs, err := filepath.Abs(f); err == nil {
+			dir := filepath.Dir(abs)
+			if err := s.watcher.Add(dir); err == nil {
+				slog.Info("Watching AWS config directory", slog.String("path", dir))
+			}
+		}
 	}
 }
 
 func (s *Supervisor) watchFiles() {
 	timer := time.NewTimer(0)
-	<-timer.C // drain immediately
+	<-timer.C // drain
 
 	var mu sync.Mutex
 	debounce := func(reason string) {
+		// If we're already shutting down, do nothing
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
 		mu.Lock()
 		defer mu.Unlock()
 		timer.Reset(debounceDelay)
@@ -231,7 +294,9 @@ func (s *Supervisor) watchFiles() {
 		select {
 		case event := <-s.watcher.Events:
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-				slog.Info("File event detected", slog.String("file", event.Name), slog.String("op", event.Op.String()))
+				slog.Info("File event detected",
+					slog.String("file", event.Name),
+					slog.String("op", event.Op.String()))
 				debounce(event.Name)
 			}
 		case err := <-s.watcher.Errors:
@@ -244,14 +309,138 @@ func (s *Supervisor) watchFiles() {
 
 func (s *Supervisor) queueRestart(reason string) {
 	select {
+	case <-s.done:
+		return
 	case s.restartEvent <- reason:
 	default:
-		// Already queued; do nothing
+		// Already queued
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Child Process Lifecycle (spawn, monitor, kill, backoff, crash-loop guard)
+// .env and OS Environment Polling
+// ─────────────────────────────────────────────────────────────────────────────
+
+// computeEnvHash reads s.envPath, sorts its key=value lines, and computes SHA256
+func (s *Supervisor) computeEnvHash() {
+	envMap, err := godotenv.Read(s.envPath)
+	if err != nil {
+		envMap = map[string]string{}
+	}
+	keys := make([]string, 0, len(envMap))
+	for k := range envMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var buf bytes.Buffer
+	for _, k := range keys {
+		buf.WriteString(k + "=" + envMap[k] + "\n")
+	}
+	hash := sha256.Sum256(buf.Bytes())
+	s.lastEnvHash = hex.EncodeToString(hash[:])
+}
+
+// captureOSEnv snapshots os.Environ()
+func (s *Supervisor) captureOSEnv() {
+	s.lastOSEnv = make(map[string]string)
+	for _, kv := range os.Environ() {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			s.lastOSEnv[parts[0]] = parts[1]
+		}
+	}
+}
+
+// detectOSEnvChanges compares current os.Environ() vs s.lastOSEnv, logs diffs, returns true if changed
+func (s *Supervisor) detectOSEnvChanges() bool {
+	current := make(map[string]string)
+	for _, kv := range os.Environ() {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			current[parts[0]] = parts[1]
+		}
+	}
+	changed := false
+	for k, v := range current {
+		if ov, ok := s.lastOSEnv[k]; !ok {
+			slog.Info("OS env added", slog.String("key", k), slog.String("val", v))
+			changed = true
+		} else if ov != v {
+			slog.Info("OS env changed", slog.String("key", k), slog.String("from", ov), slog.String("to", v))
+			changed = true
+		}
+	}
+	for k := range s.lastOSEnv {
+		if _, ok := current[k]; !ok {
+			slog.Info("OS env removed", slog.String("key", k))
+			changed = true
+		}
+	}
+	if changed {
+		s.lastOSEnv = current
+	}
+	return changed
+}
+
+// watchEnvAndOSEnv polls .env file hash + OS env every 5s
+func (s *Supervisor) watchEnvAndOSEnv() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check .env file
+			oldHash := s.lastEnvHash
+			s.computeEnvHash()
+			if s.lastEnvHash != oldHash {
+				slog.Info(".env change detected")
+				s.logEnvDiff(oldHash)
+				s.queueRestart("env_file")
+			}
+			// Check OS env
+			if s.detectOSEnvChanges() {
+				s.queueRestart("os_env")
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// logEnvDiff logs exactly what changed between old and new .env maps
+func (s *Supervisor) logEnvDiff(oldHash string) {
+	oldMap, _ := godotenv.Read(s.envPath) // best-effort old map
+	newMap, _ := godotenv.Read(s.envPath)
+	allKeys := make(map[string]struct{})
+	for k := range oldMap {
+		allKeys[k] = struct{}{}
+	}
+	for k := range newMap {
+		allKeys[k] = struct{}{}
+	}
+	keys := make([]string, 0, len(allKeys))
+	for k := range allKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		ov, ook := oldMap[k]
+		nv, nok := newMap[k]
+		switch {
+		case !ook && nok:
+			slog.Info("Env var added", slog.String("key", k), slog.String("val", nv))
+		case ook && !nok:
+			slog.Info("Env var removed", slog.String("key", k), slog.String("old", ov))
+		case ook && nok && ov != nv:
+			slog.Info("Env var changed", slog.String("key", k), slog.String("from", ov), slog.String("to", nv))
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Child Process Lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Supervisor) spawnAndMonitor() {
@@ -279,8 +468,8 @@ func (s *Supervisor) spawnAndMonitor() {
 			restartCounter.WithLabelValues(reason).Inc()
 			s.killChild()
 			continue
+
 		case err := <-exitCh:
-			// Child exited (crash or clean). Check crash-loop
 			if err != nil {
 				slog.Error("Child exited with error", slog.String("err", err.Error()))
 				crashCounter.Inc()
@@ -291,11 +480,11 @@ func (s *Supervisor) spawnAndMonitor() {
 			} else {
 				slog.Info("Child exited cleanly")
 			}
-			// Backoff before restart
 			if s.backoffAndSleep() {
 				continue
 			}
 			return
+
 		case <-s.done:
 			s.killChild()
 			return
@@ -307,33 +496,39 @@ func (s *Supervisor) startChild() error {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
 
-	bin, _ := os.Executable()
-	cmd := exec.Command(bin, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), "RUN_AS_CHILD=1")
+	if s.childCommand == "" {
+		return errors.New("no command specified")
+	}
+	// Wrap entire command in /bin/sh -c "..."
+	cmd := exec.Command("/bin/sh", "-c", s.childCommand)
+	// Inherit environment, plus tell child where .env is
+	cmd.Env = append(os.Environ(), "GOENV="+s.envPath)
 
-	// Child logs to a rotating file + stdout
+	// Put this process (shell) into its own PGID
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Child logs to rotating file + stdout
 	if err := os.MkdirAll(filepath.Dir(childLogFilePath), 0o755); err != nil {
 		slog.Error("Failed to create child log dir", slog.String("err", err.Error()))
 		return err
 	}
-	childFileLogger := &lumberjack.Logger{
+	childRotator := &lumberjack.Logger{
 		Filename:   childLogFilePath,
 		MaxSize:    10, // MB
 		MaxBackups: 5,
 		MaxAge:     28, // days
 		Compress:   true,
 	}
-	cmd.Stdout = io.MultiWriter(os.Stdout, childFileLogger)
-	cmd.Stderr = io.MultiWriter(os.Stderr, childFileLogger)
-
-	// Put child in its own process group for isolation
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout = io.MultiWriter(os.Stdout, childRotator)
+	cmd.Stderr = io.MultiWriter(os.Stderr, childRotator)
 
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	s.currentCmd = cmd
-	slog.Info("Spawned child process", slog.Int("pid", cmd.Process.Pid))
+	slog.Info("Spawned child process",
+		slog.Int("pid", cmd.Process.Pid),
+		slog.String("cmd", s.childCommand))
 	return nil
 }
 
@@ -341,14 +536,20 @@ func (s *Supervisor) killChild() {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
 
-	if s.currentCmd == nil {
+	if s.currentCmd == nil || s.currentCmd.Process == nil {
 		return
 	}
-
 	proc := s.currentCmd.Process
-	_ = proc.Signal(syscall.SIGTERM) // Graceful
-	done := make(chan struct{})
+	pgid, err := syscall.Getpgid(proc.Pid)
+	if err != nil {
+		// Fallback: kill only the top process
+		_ = proc.Signal(syscall.SIGTERM)
+	} else {
+		// Send SIGTERM to entire PGID (negative)
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	}
 
+	done := make(chan struct{})
 	go func() {
 		s.currentCmd.Wait()
 		close(done)
@@ -358,20 +559,24 @@ func (s *Supervisor) killChild() {
 	case <-done:
 		slog.Info("Child terminated gracefully")
 	case <-time.After(graceTimeout):
-		slog.Warn("Child did not exit in time; sending SIGKILL")
-		_ = proc.Kill()
+		slog.Warn("Child did not exit in time; sending SIGKILL to group")
+		if pgid >= 0 {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		} else {
+			_ = proc.Kill()
+		}
 		<-done
 	}
 	s.currentCmd = nil
 }
 
 func (s *Supervisor) resetBackoff() {
-	s.backoff = restartBackoff
+	s.backoff = 1 * time.Second
 }
 
 func (s *Supervisor) backoffAndSleep() bool {
 	d := s.backoff
-	if s.backoff < maxBackoff {
+	if s.backoff < 30*time.Second {
 		s.backoff *= 2
 	}
 	slog.Info("Supervisor backing off before restart", slog.Duration("duration", d))
@@ -383,8 +588,6 @@ func (s *Supervisor) backoffAndSleep() bool {
 	}
 }
 
-// recordCrashAndCheckLoop keeps track of recent crash timestamps and returns false
-// if the crash count exceeds crashLoopThreshold within crashLoopWindow.
 func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	s.crashTimesLock.Lock()
 	defer s.crashTimesLock.Unlock()
@@ -392,7 +595,7 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	now := time.Now()
 	windowStart := now.Add(-crashLoopWindow)
 
-	// Purge old timestamps
+	// Purge timestamps older than windowStart
 	newList := s.crashTimes[:0]
 	for _, t := range s.crashTimes {
 		if t.After(windowStart) {
@@ -401,12 +604,9 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	}
 	s.crashTimes = newList
 
-	// Append the new crash
+	// Append current crash
 	s.crashTimes = append(s.crashTimes, now)
-	if len(s.crashTimes) > crashLoopThreshold {
-		return false
-	}
-	return true
+	return len(s.crashTimes) <= crashLoopThreshold
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,7 +614,6 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Supervisor) startMetricsServer() {
-	// Gauge for uptimes
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -439,61 +638,8 @@ func (s *Supervisor) startMetricsServer() {
 		Addr:    ":" + healthPort,
 		Handler: mux,
 	}
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	err := server.ListenAndServe()
+	if err != nil && err != http.ErrServerClosed {
 		slog.Error("Metrics server error", slog.String("err", err.Error()))
 	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Worker (Child) – Fiber App with Graceful Shutdown
-// ─────────────────────────────────────────────────────────────────────────────
-
-func runWorker() {
-	// Load .env (child always starts fresh)
-	if err := godotenv.Load(envPath); err != nil {
-		slog.Warn("Could not load .env", slog.String("err", err.Error()))
-	}
-
-	// Listen for signals to gracefully shut down Fiber
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		slog.Info("Child received shutdown signal")
-		cancel()
-	}()
-
-	// Start the Fiber server
-	if err := runFiberServer(ctx); err != nil {
-		slog.Error("Fiber server error", slog.String("err", err.Error()))
-		os.Exit(1)
-	}
-}
-
-func runFiberServer(ctx context.Context) error {
-	app := fiber.New()
-
-	// Example routes
-	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString("Fiber app is running!")
-	})
-	app.Get("/readyz", func(c *fiber.Ctx) error {
-		return c.SendStatus(http.StatusOK)
-	})
-
-	// Start in background so we can listen for ctx.Done()
-	errCh := make(chan error, 1)
-	go func() {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "3000"
-		}
-		slog.Info("Child starting Fiber server", slog.String("port", port))
-		errCh <- app.Listen(":" + port)
-	}()
-	<-ctx.Done()
-	slog.Info("Draining Fiber server connections and shutting down")
-	_ = app.Shutdown()
-	return <-errCh
 }
