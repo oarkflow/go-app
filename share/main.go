@@ -1,5 +1,6 @@
 package main
 
+/*
 import (
 	"bufio"
 	"context"
@@ -116,7 +117,8 @@ func main() {
 	dutil.Advertise(ctx, routingDiscovery, config.RendezvousString)
 	// Wait to allow advertisement to propagate across networks.
 	time.Sleep(10 * time.Second)
-
+	t, _ := dutil.FindPeers(ctx, routingDiscovery, config.RendezvousString)
+	fmt.Println(t)
 	dhtChan, err := routingDiscovery.FindPeers(ctx, config.RendezvousString)
 	if err != nil {
 		panic(err)
@@ -477,3 +479,4 @@ func getBootstrapPeers(addrStrs []string) []peer.AddrInfo {
 	}
 	return peersInfo
 }
+*/
