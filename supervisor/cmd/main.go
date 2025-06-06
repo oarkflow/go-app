@@ -24,7 +24,6 @@ import (
 	"log/slog"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/joho/godotenv"
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -224,17 +223,22 @@ func (s *Supervisor) initWatcher() {
 		os.Exit(1)
 	}
 
-	// Watch the directory containing the configured .env
-	if abs, err := filepath.Abs(s.envPath); err == nil {
-		if err := s.watcher.Add(abs); err != nil {
-			slog.Error("Failed to watch .env directory",
-				slog.String(".env", s.envPath), slog.String("err", err.Error()))
+	// Watch each env file directory.
+	envFiles := strings.Split(s.envPath, ",")
+	for _, file := range envFiles {
+		file = strings.TrimSpace(file)
+		if abs, err := filepath.Abs(file); err == nil {
+			dir := filepath.Dir(abs)
+			if err := s.watcher.Add(dir); err != nil {
+				slog.Error("Failed to watch env directory",
+					slog.String("file", file), slog.String("err", err.Error()))
+				os.Exit(1)
+			}
+			slog.Info("Watching env file", slog.String("path", abs))
+		} else {
+			slog.Error("Unable to resolve env file", slog.String("file", file), slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-		slog.Info("Watching .env file", slog.String("path", abs))
-	} else {
-		slog.Error("Unable to resolve .env path", slog.String("err", err.Error()))
-		os.Exit(1)
 	}
 
 	// Watch the directory containing this supervisor binary
@@ -322,18 +326,22 @@ func (s *Supervisor) queueRestart(reason string) {
 
 // computeEnvHash reads s.envPath, sorts its key=value lines, and computes SHA256
 func (s *Supervisor) computeEnvHash() {
-	envMap, err := godotenv.Read(s.envPath)
-	if err != nil {
-		envMap = map[string]string{}
-	}
-	keys := make([]string, 0, len(envMap))
-	for k := range envMap {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	// Support multiple env files separated by comma.
+	files := strings.Split(s.envPath, ",")
+	// Sort filenames for consistent ordering
+	sort.Strings(files)
 	var buf bytes.Buffer
-	for _, k := range keys {
-		buf.WriteString(k + "=" + envMap[k] + "\n")
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		data, err := os.ReadFile(file)
+		if err != nil {
+			// Skip missing or unreadable files.
+			continue
+		}
+		// Append filename and content to differentiate each file.
+		buf.WriteString("file:" + file + "\n")
+		buf.Write(data)
+		buf.WriteString("\n")
 	}
 	hash := sha256.Sum256(buf.Bytes())
 	s.lastEnvHash = hex.EncodeToString(hash[:])
@@ -461,8 +469,8 @@ func (s *Supervisor) startChild() error {
 	}
 	// Wrap entire command in /bin/sh -c "..."
 	cmd := exec.Command("/bin/sh", "-c", s.childCommand)
-	// Inherit environment, plus tell child where .env is
-	cmd.Env = append(os.Environ(), "GOENV="+s.envPath)
+	// Do not modify OS env by loading env file; simply inherit existing environment.
+	cmd.Env = os.Environ()
 
 	// Put this process (shell) into its own PGID
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

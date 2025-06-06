@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json" // added for JSON env files
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings" // added for splitting env paths
 	"sync"
 	"syscall"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v2" // added for YAML env files
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,7 +31,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	envPath          = ".env"
+	envPath          = ".env, databases.json"
 	graceTimeout     = 5 * time.Second
 	debounceDelay    = 500 * time.Millisecond
 	pidFile          = "/tmp/supervisor.pid"
@@ -198,11 +201,18 @@ func (s *Supervisor) initWatcher() {
 	}
 
 	bin, _ := os.Executable()
-	toWatch := []string{envPath, bin}
+	// Split envPath by comma and add each file to the list to watch
+	envFiles := strings.Split(envPath, ",")
+	toWatch := []string{bin}
+	for _, f := range envFiles {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			toWatch = append(toWatch, f)
+		}
+	}
 	for _, file := range toWatch {
 		abs, _ := filepath.Abs(file)
-		dir := filepath.Dir(abs)
-		if err := s.watcher.Add(dir); err != nil {
+		if err := s.watcher.Add(abs); err != nil {
 			slog.Error("Failed to add watcher", slog.String("file", file), slog.String("err", err.Error()))
 			os.Exit(1)
 		}
@@ -447,10 +457,8 @@ func (s *Supervisor) startMetricsServer() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func runWorker() {
-	// Load .env (child always starts fresh)
-	if err := godotenv.Load(envPath); err != nil {
-		slog.Warn("Could not load .env", slog.String("err", err.Error()))
-	}
+	// Load multiple env files separated by comma
+	_ = setup(envPath)
 
 	// Listen for signals to gracefully shut down Fiber
 	ctx, cancel := context.WithCancel(context.Background())
@@ -494,4 +502,57 @@ func runFiberServer(ctx context.Context) error {
 	slog.Info("Draining Fiber server connections and shutting down")
 	_ = app.Shutdown()
 	return <-errCh
+}
+
+// New helper functions to load env files of various types
+
+func setup(paths string) error {
+	parts := strings.Split(paths, ",")
+	for _, path := range parts {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		ext := filepath.Ext(path)
+		switch ext {
+		case ".env":
+			if err := godotenv.Load(path); err != nil {
+				slog.Warn("Failed to load .env file", slog.String("file", path), slog.String("err", err.Error()))
+			}
+
+		default:
+			slog.Warn("Unsupported env file type", slog.String("file", path))
+		}
+	}
+	return nil
+}
+
+func loadJSONEnv(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var envMap map[string]interface{}
+	if err := json.Unmarshal(data, &envMap); err != nil {
+		return err
+	}
+	for k, v := range envMap {
+		os.Setenv(k, fmt.Sprintf("%v", v))
+	}
+	return nil
+}
+
+func loadYAMLEnv(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var envMap map[string]interface{}
+	if err := yaml.Unmarshal(data, &envMap); err != nil {
+		return err
+	}
+	for k, v := range envMap {
+		os.Setenv(k, fmt.Sprintf("%v", v))
+	}
+	return nil
 }
