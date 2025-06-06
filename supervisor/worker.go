@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context" // for JSON env files
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,43 +23,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 const (
-	// Comma‐separated list of files to watch/load as env sources:
-	envPath = ".env, databases.json"
-
-	// Graceful‐shutdown time for killing child:
-	graceTimeout = 5 * time.Second
-
-	// Debounce delay for FS notifications (in milliseconds):
-	debounceDelay = 500 * time.Millisecond
-
-	// Path to PID file for supervisor:
-	pidFile = "/tmp/supervisor.pid"
-
-	// Port where metrics & healthz listen:
-	healthPort = "9999"
-
-	// Where to write supervisor logs:
-	logFilePath = "./log/myapp/supervisor.log"
-
-	// Where to write child logs:
-	childLogFilePath = "./log/myapp/child.log"
-
-	// Initial restart backoff, doubles up to maxBackoff:
-	restartBackoff = 1 * time.Second
-	maxBackoff     = 30 * time.Second
-
-	// Crash‐loop protection: if > crashLoopThreshold crashes within crashLoopWindow, exit:
+	envPath            = ".env, databases.json"
+	graceTimeout       = 5 * time.Second
+	debounceDelay      = 500 * time.Millisecond
+	pidFile            = "/tmp/supervisor.pid"
+	healthPort         = "9999"
+	logFilePath        = "./log/myapp/supervisor.log"
+	childLogFilePath   = "./log/myapp/child.log"
+	restartBackoff     = 1 * time.Second
+	maxBackoff         = 30 * time.Second
 	crashLoopThreshold = 5
 	crashLoopWindow    = 1 * time.Minute
 )
 
 var (
-	// Prometheus metrics:
 	restartCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "supervisor_restart_total",
@@ -82,13 +60,8 @@ var (
 )
 
 func init() {
-	// Register Prometheus metrics
 	prometheus.MustRegister(restartCounter, crashCounter, uptimeGauge)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Supervisor Struct (manages child process, FS watching, metrics, etc.)
-// ─────────────────────────────────────────────────────────────────────────────
 
 type Supervisor struct {
 	cmdLock        sync.Mutex
@@ -109,24 +82,18 @@ func (s *Supervisor) initWatcher(envFiles []string) {
 		slog.Error("Failed to create fsnotify watcher", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
-
-	// Watch the supervisor binary itself:
 	binPath, _ := os.Executable()
 	toWatch := []string{binPath}
-
-	// Add each env file path to watch:
 	for _, f := range envFiles {
 		if f == "" {
 			continue
 		}
-		// Make sure to watch the absolute path (so symlink moves still trigger events):
 		if abs, err := filepath.Abs(f); err == nil {
 			toWatch = append(toWatch, abs)
 		} else {
 			toWatch = append(toWatch, f)
 		}
 	}
-
 	for _, file := range toWatch {
 		if err := s.watcher.Add(file); err != nil {
 			slog.Error("Failed to add watcher", slog.String("file", file), slog.String("err", err.Error()))
@@ -137,10 +104,8 @@ func (s *Supervisor) initWatcher(envFiles []string) {
 }
 
 func (s *Supervisor) watchFiles() {
-	// Create a timer that we can reset for debouncing:
 	timer := time.NewTimer(0)
-	<-timer.C // drain immediately
-
+	<-timer.C
 	var mu sync.Mutex
 	debounce := func(reason string) {
 		mu.Lock()
@@ -151,11 +116,9 @@ func (s *Supervisor) watchFiles() {
 			s.queueRestart(reason)
 		}()
 	}
-
 	for {
 		select {
 		case event := <-s.watcher.Events:
-			// Only respond to Write/Create/Rename; skip Chmod, Remove, etc.
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 				slog.Info("File event detected", slog.String("file", event.Name), slog.String("op", event.Op.String()))
 				debounce(event.Name)
@@ -172,44 +135,32 @@ func (s *Supervisor) queueRestart(reason string) {
 	select {
 	case s.restartEvent <- reason:
 	default:
-		// already queued—ignore
 	}
 }
 
 func (s *Supervisor) spawnAndMonitor() {
 	for {
-		// Exit if supervisor is shutting down:
 		select {
 		case <-s.done:
 			return
 		default:
 		}
-
-		// Reset backoff before launching child:
 		s.backoff = restartBackoff
-
-		// Start child process:
 		if err := s.startChild(); err != nil {
 			slog.Error("Failed to start child process", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-
-		// Wait for child exit or for a restart event:
 		exitCh := make(chan error, 1)
 		go func() {
 			exitCh <- s.currentCmd.Wait()
 		}()
-
 		select {
 		case reason := <-s.restartEvent:
-			// SIGHUP or file‐change triggered:
 			slog.Info("Supervisor restarting child", slog.String("reason", reason))
 			restartCounter.WithLabelValues(reason).Inc()
 			s.killChild()
 			continue
-
 		case err := <-exitCh:
-			// Child exited (crash or normal)
 			if err != nil {
 				slog.Error("Child exited with error", slog.String("err", err.Error()))
 				crashCounter.Inc()
@@ -220,14 +171,11 @@ func (s *Supervisor) spawnAndMonitor() {
 			} else {
 				slog.Info("Child exited cleanly")
 			}
-			// Backoff before restarting:
 			if s.backoffAndSleep() {
 				continue
 			}
 			return
-
 		case <-s.done:
-			// Supervisor shutdown requested—kill child and exit:
 			s.killChild()
 			return
 		}
@@ -237,33 +185,26 @@ func (s *Supervisor) spawnAndMonitor() {
 func (s *Supervisor) startChild() error {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
-
 	binPath, _ := os.Executable()
 	cmd := exec.Command(binPath, os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "RUN_AS_CHILD=1")
-
-	// Ensure child logs directory:
 	if err := os.MkdirAll(filepath.Dir(childLogFilePath), 0o755); err != nil {
 		slog.Error("Failed to create child log dir", slog.String("err", err.Error()))
 		return err
 	}
 	childFileLogger := &lumberjack.Logger{
 		Filename:   childLogFilePath,
-		MaxSize:    10, // MB
+		MaxSize:    10,
 		MaxBackups: 5,
-		MaxAge:     28, // days
+		MaxAge:     28,
 		Compress:   true,
 	}
 	cmd.Stdout = io.MultiWriter(os.Stdout, childFileLogger)
 	cmd.Stderr = io.MultiWriter(os.Stderr, childFileLogger)
-
-	// Put child in its own process group for isolation:
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-
 	s.currentCmd = cmd
 	slog.Info("Spawned child process", slog.Int("pid", cmd.Process.Pid))
 	return nil
@@ -272,20 +213,16 @@ func (s *Supervisor) startChild() error {
 func (s *Supervisor) killChild() {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
-
 	if s.currentCmd == nil {
 		return
 	}
-
 	proc := s.currentCmd.Process
-	_ = proc.Signal(syscall.SIGTERM) // graceful
-
+	_ = proc.Signal(syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
 		s.currentCmd.Wait()
 		close(done)
 	}()
-
 	select {
 	case <-done:
 		slog.Info("Child terminated gracefully")
@@ -311,15 +248,11 @@ func (s *Supervisor) backoffAndSleep() bool {
 	}
 }
 
-// recordCrashAndCheckLoop returns false if crashes in window exceed threshold:
 func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	s.crashTimesLock.Lock()
 	defer s.crashTimesLock.Unlock()
-
 	now := time.Now()
 	windowStart := now.Add(-crashLoopWindow)
-
-	// Purge old timestamps:
 	filtered := s.crashTimes[:0]
 	for _, t := range s.crashTimes {
 		if t.After(windowStart) {
@@ -327,8 +260,6 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 		}
 	}
 	s.crashTimes = filtered
-
-	// Append newest crash:
 	s.crashTimes = append(s.crashTimes, now)
 	if len(s.crashTimes) > crashLoopThreshold {
 		return false
@@ -337,7 +268,6 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 }
 
 func (s *Supervisor) startMetricsServer() {
-	// Update uptime gauge every 5 seconds:
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -350,7 +280,6 @@ func (s *Supervisor) startMetricsServer() {
 			}
 		}
 	}()
-
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -367,12 +296,7 @@ func (s *Supervisor) startMetricsServer() {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Child (Worker) Logic: loads env files, runs callback under context
-// ─────────────────────────────────────────────────────────────────────────────
-
 func runWorker(callback func(ctx context.Context) error) {
-	// Create a cancellable context and listen for SIGINT/SIGTERM:
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -381,40 +305,26 @@ func runWorker(callback func(ctx context.Context) error) {
 		slog.Info("Child received shutdown signal")
 		cancel()
 	}()
-
-	// Now invoke the callback (e.g. runApp) under this context:
 	if err := callback(ctx); err != nil {
 		slog.Error("Worker callback returned error", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Example Fiber Server (this is your callback)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Logging Setup (supervisor writes to both stdout and a rotating file)
-// ─────────────────────────────────────────────────────────────────────────────
-
 func setupSupervisorLogging() {
-	// Ensure log directory exists:
 	if err := os.MkdirAll(filepath.Dir(logFilePath), 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Could not create log dir: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Lumberjack rotating logger for supervisor:
 	fileLogger := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    10, // MB
-		MaxBackups: 5,  // number of old log files to keep
-		MaxAge:     28, // days
+		MaxSize:    10,
+		MaxBackups: 5,
+		MaxAge:     28,
 		Compress:   true,
 	}
-
-	mw := io.MultiWriter(os.Stdout, fileLogger)                                // write to both stdout and file
-	handler := slog.NewTextHandler(mw, &slog.HandlerOptions{AddSource: false}) // no file:line on each entry
+	mw := io.MultiWriter(os.Stdout, fileLogger)
+	handler := slog.NewTextHandler(mw, &slog.HandlerOptions{AddSource: false})
 	slog.SetDefault(slog.New(handler))
 }
 
@@ -430,54 +340,36 @@ func removePIDFile() {
 	_ = os.Remove(pidFile)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Run Function: entrypoint that wires Supervisor vs. Worker based on env
-// ─────────────────────────────────────────────────────────────────────────────
-
 func Run(callback func(ctx context.Context) error) {
-	// If RUN_AS_CHILD=1, act as the child (invoke callback):
 	if os.Getenv("RUN_AS_CHILD") == "1" {
-		setupSupervisorLogging() // still use the same logger format for child
+		setupSupervisorLogging()
 		slog.Info("Child starting up")
 		runWorker(callback)
 		return
 	}
-
-	// Supervisor mode:
 	setupSupervisorLogging()
 	checkOrCreatePIDFile()
 	defer removePIDFile()
-
 	slog.Info("Supervisor starting...")
-
-	// Prepare Supervisor struct:
 	s := &Supervisor{
 		restartEvent: make(chan string, 1),
 		done:         make(chan struct{}),
 		backoff:      restartBackoff,
 		startTime:    time.Now(),
 	}
-
-	// Parse envPath into a list of files for watcher:
 	var envFiles []string
 	for _, raw := range strings.Split(envPath, ",") {
 		if f := strings.TrimSpace(raw); f != "" {
 			envFiles = append(envFiles, f)
 		}
 	}
-
 	s.initWatcher(envFiles)
 	defer s.watcher.Close()
-
-	// Start watcher, child monitor, and metrics server:
 	go s.watchFiles()
 	go s.spawnAndMonitor()
 	go s.startMetricsServer()
-
-	// Handle signals: SIGHUP=reload, SIGINT/SIGTERM=shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
-
 	for {
 		select {
 		case sig := <-sigCh:
@@ -485,7 +377,7 @@ func Run(callback func(ctx context.Context) error) {
 			case syscall.SIGHUP:
 				slog.Info("SIGHUP received: scheduling reload")
 				s.queueRestart("sighup")
-			default: // SIGINT or SIGTERM
+			default:
 				slog.Info("Shutdown signal received: tearing down child and exiting")
 				close(s.done)
 				s.killChild()
