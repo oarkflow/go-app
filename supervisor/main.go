@@ -226,13 +226,12 @@ func (s *Supervisor) initWatcher() {
 
 	// Watch the directory containing the configured .env
 	if abs, err := filepath.Abs(s.envPath); err == nil {
-		dir := filepath.Dir(abs)
-		if err := s.watcher.Add(dir); err != nil {
+		if err := s.watcher.Add(abs); err != nil {
 			slog.Error("Failed to watch .env directory",
-				slog.String("dir", dir), slog.String("err", err.Error()))
+				slog.String(".env", s.envPath), slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-		slog.Info("Watching .env directory", slog.String("path", dir))
+		slog.Info("Watching .env file", slog.String("path", abs))
 	} else {
 		slog.Error("Unable to resolve .env path", slog.String("err", err.Error()))
 		os.Exit(1)
@@ -390,51 +389,12 @@ func (s *Supervisor) watchEnvAndOSEnv() {
 	for {
 		select {
 		case <-ticker.C:
-			// Check .env file
-			oldHash := s.lastEnvHash
-			s.computeEnvHash()
-			if s.lastEnvHash != oldHash {
-				slog.Info(".env change detected")
-				s.logEnvDiff(oldHash)
-				s.queueRestart("env_file")
-			}
 			// Check OS env
 			if s.detectOSEnvChanges() {
 				s.queueRestart("os_env")
 			}
 		case <-s.done:
 			return
-		}
-	}
-}
-
-// logEnvDiff logs exactly what changed between old and new .env maps
-func (s *Supervisor) logEnvDiff(oldHash string) {
-	oldMap, _ := godotenv.Read(s.envPath) // best-effort old map
-	newMap, _ := godotenv.Read(s.envPath)
-	allKeys := make(map[string]struct{})
-	for k := range oldMap {
-		allKeys[k] = struct{}{}
-	}
-	for k := range newMap {
-		allKeys[k] = struct{}{}
-	}
-	keys := make([]string, 0, len(allKeys))
-	for k := range allKeys {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		ov, ook := oldMap[k]
-		nv, nok := newMap[k]
-		switch {
-		case !ook && nok:
-			slog.Info("Env var added", slog.String("key", k), slog.String("val", nv))
-		case ook && !nok:
-			slog.Info("Env var removed", slog.String("key", k), slog.String("old", ov))
-		case ook && nok && ov != nv:
-			slog.Info("Env var changed", slog.String("key", k), slog.String("from", ov), slog.String("to", nv))
 		}
 	}
 }
