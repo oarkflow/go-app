@@ -73,6 +73,7 @@ type Supervisor struct {
 	crashTimes     []time.Time
 	crashTimesLock sync.Mutex
 	startTime      time.Time
+	httpServer     *http.Server
 }
 
 func (s *Supervisor) initWatcher(envFiles []string) {
@@ -165,7 +166,7 @@ func (s *Supervisor) spawnAndMonitor() {
 				slog.Error("Child exited with error", slog.String("err", err.Error()))
 				crashCounter.Inc()
 				if !s.recordCrashAndCheckLoop() {
-					slog.Error("Too many child crashes in short time; exiting supervisor")
+					slog.Error("Too many child crashes in short window; supervisor exiting")
 					os.Exit(1)
 				}
 			} else {
@@ -189,7 +190,7 @@ func (s *Supervisor) startChild() error {
 	cmd := exec.Command(binPath, os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "RUN_AS_CHILD=1")
 	if err := os.MkdirAll(filepath.Dir(childLogFilePath), 0o755); err != nil {
-		slog.Error("Failed to create child log dir", slog.String("err", err.Error()))
+		slog.Error("Failed to create child log directory", slog.String("err", err.Error()))
 		return err
 	}
 	childFileLogger := &lumberjack.Logger{
@@ -213,7 +214,7 @@ func (s *Supervisor) startChild() error {
 func (s *Supervisor) killChild() {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
-	if s.currentCmd == nil {
+	if s.currentCmd == nil || s.currentCmd.Process == nil {
 		return
 	}
 	proc := s.currentCmd.Process
@@ -240,10 +241,12 @@ func (s *Supervisor) backoffAndSleep() bool {
 		s.backoff *= 2
 	}
 	slog.Info("Supervisor backing off before restart", slog.Duration("duration", d))
+	timer := time.NewTimer(d)
 	select {
-	case <-time.After(d):
+	case <-timer.C:
 		return true
 	case <-s.done:
+		timer.Stop()
 		return false
 	}
 }
@@ -254,9 +257,9 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	now := time.Now()
 	windowStart := now.Add(-crashLoopWindow)
 	filtered := s.crashTimes[:0]
-	for _, t := range s.crashTimes {
-		if t.After(windowStart) {
-			filtered = append(filtered, t)
+	for _, ts := range s.crashTimes {
+		if ts.After(windowStart) {
+			filtered = append(filtered, ts)
 		}
 	}
 	s.crashTimes = filtered
@@ -286,13 +289,24 @@ func (s *Supervisor) startMetricsServer() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	slog.Info("Metrics/health listening", slog.String("port", healthPort))
 	server := &http.Server{
 		Addr:    ":" + healthPort,
 		Handler: mux,
 	}
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("Metrics server error", slog.String("err", err.Error()))
+	s.httpServer = server
+	go func() {
+		slog.Info("Metrics/health listening", slog.String("port", healthPort))
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Metrics server ListenAndServe error", slog.String("err", err.Error()))
+		}
+	}()
+	<-s.done
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("Metrics server shutdown error", slog.String("err", err.Error()))
+	} else {
+		slog.Info("Metrics server shut down cleanly")
 	}
 }
 
@@ -329,6 +343,10 @@ func setupSupervisorLogging() {
 }
 
 func checkOrCreatePIDFile() {
+	if _, err := os.Stat(pidFile); err == nil {
+		slog.Error("PID file already exists; another instance may be running", slog.String("file", pidFile))
+		os.Exit(1)
+	}
 	pid := os.Getpid()
 	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0o644); err != nil {
 		slog.Error("Failed to write PID file", slog.String("err", err.Error()))
