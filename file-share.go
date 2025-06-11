@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/grandcat/zeroconf"
-	"github.com/jackpal/gateway"
-	natpmp "github.com/jackpal/go-nat-pmp"
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -54,19 +52,7 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	sigPort := rand.Intn(10000) + 20000
 
-	// 2) NAT-PMP port mapping
-	if gwIP, err := gateway.DiscoverGateway(); err == nil {
-		client := natpmp.NewClient(gwIP)
-		if _, err := client.AddPortMapping("udp", sigPort, sigPort, ttl); err == nil {
-			log.Printf("→ NAT-PMP mapped UDP port %d\n", sigPort)
-		} else {
-			log.Println("! NAT-PMP port mapping failed:", err)
-		}
-	} else {
-		log.Println("! No NAT gateway found:", err)
-	}
-
-	// 3) Listen for LAN signaling (UDP)
+	// 2) Listen for LAN signaling (UDP)
 	var err error
 	udpConn, err = net.ListenPacket("udp4", fmt.Sprintf(":%d", sigPort))
 	if err != nil {
@@ -74,14 +60,17 @@ func main() {
 	}
 	defer udpConn.Close()
 
-	// 4) Create a libp2p host over TCP
-	host, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	// 3) Create a libp2p host with relay support
+	host, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.EnableRelay(),
+	)
 	if err != nil {
 		log.Fatal("libp2p New:", err)
 	}
 
-	// 5) Kademlia DHT + bootstrap (convert each Multiaddr → AddrInfo)
-	kad, err := dht.New(ctx, host)
+	// 4) Kademlia DHT with auto-relay
+	kad, err := dht.New(ctx, host, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -229,8 +218,10 @@ func udpListener(pc *webrtc.PeerConnection) {
 	for {
 		n, _, _ := udpConn.ReadFrom(buf)
 		var m signalMsg
-		if json.Unmarshal(buf[:n], &m) == nil {
+		if err := json.Unmarshal(buf[:n], &m); err == nil {
 			apply(pc, m)
+		} else {
+			log.Println("Failed to unmarshal UDP message:", err)
 		}
 	}
 }
@@ -242,8 +233,10 @@ func pubsubListener(pc *webrtc.PeerConnection, sub *pubsub.Subscription) {
 			return
 		}
 		var m signalMsg
-		if json.Unmarshal(ev.Data, &m) == nil {
+		if err := json.Unmarshal(ev.Data, &m); err == nil {
 			apply(pc, m)
+		} else {
+			log.Println("Failed to unmarshal PubSub message:", err)
 		}
 	}
 }
@@ -251,11 +244,13 @@ func pubsubListener(pc *webrtc.PeerConnection, sub *pubsub.Subscription) {
 func apply(pc *webrtc.PeerConnection, m signalMsg) {
 	switch m.Type {
 	case "offer":
+		fmt.Println("Received offer, creating answer...")
 		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: m.SDP})
 		ans, _ := pc.CreateAnswer(nil)
 		pc.SetLocalDescription(ans)
 		broadcast(signalMsg{"answer", ans.SDP})
 	case "answer":
+		fmt.Println("Received answer, setting remote description...")
 		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP})
 	}
 }
