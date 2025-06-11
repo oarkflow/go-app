@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -15,124 +16,132 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackpal/gateway"
-
 	"github.com/grandcat/zeroconf"
+	"github.com/jackpal/gateway"
 	natpmp "github.com/jackpal/go-nat-pmp"
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	peer "github.com/libp2p/go-libp2p/core/peer" // added for AddrInfoFromP2pAddr
+	peer "github.com/libp2p/go-libp2p/core/peer"
 	peerstore "github.com/libp2p/go-libp2p/core/peerstore"
 	multiaddr "github.com/multiformats/go-multiaddr"
 	webrtc "github.com/pion/webrtc/v3"
 )
 
 const (
-	ServiceType  = "_p2pchat._udp"
-	Domain       = "local."
-	PubSubTopic  = "p2pchat-room"
-	sigPortConst = 5353 // used for signaling over multicast
+	mdnsService = "_p2pchat._udp"
+	mdnsDomain  = "local."
+	topicName   = "p2pchat-room"
+	ttl         = 3600 // NAT-PMP lease time
 )
 
-type Signal struct {
+type signalMsg struct {
 	Type string `json:"type"` // "offer" or "answer"
 	SDP  string `json:"sdp"`
 }
 
-// Global variables for signaling
-var sigUdpConn net.PacketConn
-var sigTopic *pubsub.Topic
-
-// Helper to return a port number for signaling.
-func sigPort(b []byte) int {
-	return sigPortConst
-}
+var (
+	udpConn net.PacketConn
+	psTopic *pubsub.Topic
+	once    sync.Once
+)
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Random UDP port for LAN signaling
+	// 1) Random UDP port for LAN signaling
 	rand.Seed(time.Now().UnixNano())
-	udpPort := rand.Intn(10000) + 10000
+	sigPort := rand.Intn(10000) + 20000
 
-	gatewayIP, err := gateway.DiscoverGateway()
-	if err != nil {
-		return
+	// 2) NAT-PMP port mapping
+	if gwIP, err := gateway.DiscoverGateway(); err == nil {
+		client := natpmp.NewClient(gwIP)
+		if _, err := client.AddPortMapping("udp", sigPort, sigPort, ttl); err == nil {
+			log.Printf("→ NAT-PMP mapped UDP port %d\n", sigPort)
+		} else {
+			log.Println("! NAT-PMP port mapping failed:", err)
+		}
+	} else {
+		log.Println("! No NAT gateway found:", err)
 	}
 
-	gateway := natpmp.NewClient(gatewayIP)
-	if gateway != nil {
-		if _, err := gateway.AddPortMapping("udp", udpPort, udpPort, 3600); err == nil {
-			log.Println("Mapped UDP port via NAT-PMP:", udpPort)
+	// 3) Listen for LAN signaling (UDP)
+	var err error
+	udpConn, err = net.ListenPacket("udp4", fmt.Sprintf(":%d", sigPort))
+	if err != nil {
+		log.Fatal("UDP listen:", err)
+	}
+	defer udpConn.Close()
+
+	// 4) Create a libp2p host over TCP
+	host, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	if err != nil {
+		log.Fatal("libp2p New:", err)
+	}
+
+	// 5) Kademlia DHT + bootstrap (convert each Multiaddr → AddrInfo)
+	kad, err := dht.New(ctx, host)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := kad.Bootstrap(ctx); err != nil {
+		log.Fatal(err)
+	}
+	for _, maddr := range dht.DefaultBootstrapPeers {
+		ai, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			continue
+		}
+		host.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.PermanentAddrTTL)
+		if err := host.Connect(ctx, *ai); err != nil {
+			log.Println("bootstrap connect:", err)
 		}
 	}
 
-	// 2) LAN signaling listener
-	udpConn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", udpPort))
-	if err != nil {
-		log.Fatal("UDP listen failed:", err)
-	}
-	sigUdpConn = udpConn // assign global variable
-	defer udpConn.Close()
-
-	// 3) libp2p host + DHT + pubsub
-	host, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"), // corrected multiaddr
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	kademliaDHT, err := dht.New(ctx, host)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := kademliaDHT.Bootstrap(ctx); err != nil {
-		log.Fatal(err)
-	}
+	// 6) PubSub for Internet-wide signaling
 	ps, err := pubsub.NewGossipSub(ctx, host)
 	if err != nil {
 		log.Fatal(err)
 	}
-	topic, _ := ps.Join(PubSubTopic)
-	sigTopic = topic // assign global variable
-	sub, _ := topic.Subscribe()
-
-	// Gather host multiaddrs
-	addrs := host.Addrs()
-	addrStrings := make([]string, len(addrs))
-	for i, addr := range addrs {
-		addrStrings[i] = addr.String()
-	}
-
-	// 4) mDNS announce our nodeID, UDP port, and libp2p addrs via TXT
-	nodeID := fmt.Sprintf("node-%04d", rand.Intn(10000))
-	txt := append([]string{fmt.Sprintf("port=%d", udpPort)}, addrStrings...)
-	mdnsSrv, err := zeroconf.Register(nodeID, ServiceType, Domain, udpPort, txt, nil)
+	psTopic, err = ps.Join(topicName)
 	if err != nil {
-		log.Fatalln("mDNS register error:", err)
+		log.Fatal(err)
 	}
-	defer mdnsSrv.Shutdown()
+	sub, err := psTopic.Subscribe()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// mDNS browse
+	// 7) mDNS announce our node + info
+	nodeID := fmt.Sprintf("node-%04d", rand.Intn(10000))
+	txt := []string{fmt.Sprintf("port=%d", sigPort)}
+	for _, ma := range host.Addrs() {
+		txt = append(txt, ma.String())
+	}
+	mdnsServer, err := zeroconf.Register(nodeID, mdnsService, mdnsDomain, sigPort, txt, nil)
+	if err != nil {
+		log.Fatal("mDNS register:", err)
+	}
+	defer mdnsServer.Shutdown()
+
+	// 8) Browse mDNS in background
 	resolver, _ := zeroconf.NewResolver(nil)
 	entries := make(chan *zeroconf.ServiceEntry)
 	go func() {
-		if err := resolver.Browse(ctx, ServiceType, Domain, entries); err != nil {
-			log.Println("mDNS browse error:", err)
+		if err := resolver.Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+			log.Println("mDNS browse:", err)
 		}
 	}()
 
-	// 5) WebRTC API setup
+	// 9) Prepare WebRTC
 	m := webrtc.SettingEngine{}
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(m))
-	config := webrtc.Configuration{}
+	cfg := webrtc.Configuration{} // no ICE servers
 
-	var once sync.Once
 	negotiate := func(isOfferer bool) {
 		once.Do(func() {
-			pc, err := api.NewPeerConnection(config)
+			pc, err := api.NewPeerConnection(cfg)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -141,50 +150,50 @@ func main() {
 				log.Fatal(err)
 			}
 			dc.OnOpen(func() {
-				log.Println("Data channel opened")
+				log.Println("DataChannel opened! Type and press enter:")
 				go func() {
-					scanner := bufio.NewScanner(os.Stdin)
-					for scanner.Scan() {
-						dc.SendText(scanner.Text())
+					scan := bufio.NewScanner(os.Stdin)
+					for scan.Scan() {
+						dc.SendText(scan.Text())
 					}
 				}()
 			})
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-				log.Printf("Received: %s", string(msg.Data))
+				fmt.Printf("← %s\n", string(msg.Data))
 			})
 
-			// Exchange offers/answers
 			if isOfferer {
-				offer, err := pc.CreateOffer(nil)
-				if err != nil {
-					log.Fatal(err)
-				}
+				offer, _ := pc.CreateOffer(nil)
 				pc.SetLocalDescription(offer)
-				signalAll(udpConn, topic, Signal{"offer", offer.SDP})
+				broadcast(signalMsg{"offer", offer.SDP})
 			}
-
-			// Handle incoming signaling
-			go handleUDP(udpConn, pc)
-			go handlePubSub(sub, pc)
+			go udpListener(pc)
+			go pubsubListener(pc, sub)
 		})
 	}
 
-	// Discovery: on LAN or DHT/pubsub
+	// 10) Discovery loops
 	go func() {
 		for e := range entries {
 			if e.Instance == nodeID {
 				continue
 			}
-			log.Println("LAN peer found:", e.Instance)
-			// connect to libp2p addrs from TXT
-			for _, v := range e.Text {
-				if strings.HasPrefix(v, "/") {
-					if maddr, err := multiaddr.NewMultiaddr(v); err == nil {
-						if pi, err := peer.AddrInfoFromP2pAddr(maddr); err == nil { // modified call
-							host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.PermanentAddrTTL)
-							host.Connect(ctx, *pi)
-						}
-					}
+			log.Println("→ LAN peer:", e.Instance)
+			for _, txt := range e.Text {
+				if !strings.HasPrefix(txt, "/") {
+					continue
+				}
+				ma, err := multiaddr.NewMultiaddr(txt)
+				if err != nil {
+					continue
+				}
+				ai, err := peer.AddrInfoFromP2pAddr(ma)
+				if err != nil {
+					continue
+				}
+				host.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.PermanentAddrTTL)
+				if err := host.Connect(ctx, *ai); err != nil {
+					log.Println("libp2p connect:", err)
 				}
 			}
 			negotiate(nodeID > e.Instance)
@@ -196,63 +205,57 @@ func main() {
 			if err != nil {
 				return
 			}
-			var s Signal
-			if json.Unmarshal(ev.Data, &s) == nil && s.Type != "" {
-				log.Println("PubSub signaling event")
-				negotiate(s.Type == "answer")
+			var m signalMsg
+			if json.Unmarshal(ev.Data, &m) == nil {
+				log.Println("→ PubSub signal:", m.Type)
+				negotiate(m.Type == "offer")
 			}
 		}
 	}()
 
-	log.Println("Node ID:", nodeID)
+	log.Printf("Running as %s – Ctrl+C to quit\n", nodeID)
 	<-ctx.Done()
 }
 
-// signalAll broadcasts the Signal via UDP and PubSub.
-func signalAll(udpConn net.PacketConn, topic *pubsub.Topic, sig Signal) {
+// broadcast sends SDP over LAN (multicast UDP) and the PubSub topic.
+func broadcast(sig signalMsg) {
 	b, _ := json.Marshal(sig)
-	udpConn.WriteTo(b, &net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: sigPort(b)})
-	topic.Publish(context.Background(), b)
+	udpConn.WriteTo(b, &net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353})
+	psTopic.Publish(context.Background(), b)
 }
 
-func handleUDP(conn net.PacketConn, pc *webrtc.PeerConnection) {
-	buf := make([]byte, 1500)
+func udpListener(pc *webrtc.PeerConnection) {
+	buf := make([]byte, 1600)
 	for {
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			continue
+		n, _, _ := udpConn.ReadFrom(buf)
+		var m signalMsg
+		if json.Unmarshal(buf[:n], &m) == nil {
+			apply(pc, m)
 		}
-		var s Signal
-		if json.Unmarshal(buf[:n], &s) != nil {
-			continue
-		}
-		applySignal(pc, s)
 	}
 }
 
-func handlePubSub(sub *pubsub.Subscription, pc *webrtc.PeerConnection) {
+func pubsubListener(pc *webrtc.PeerConnection, sub *pubsub.Subscription) {
 	for {
 		ev, err := sub.Next(context.Background())
 		if err != nil {
 			return
 		}
-		var s Signal
-		if json.Unmarshal(ev.Data, &s) == nil {
-			applySignal(pc, s)
+		var m signalMsg
+		if json.Unmarshal(ev.Data, &m) == nil {
+			apply(pc, m)
 		}
 	}
 }
 
-// In applySignal, replace the pc.WriteRTCP call with a broadcast using signalAll.
-func applySignal(pc *webrtc.PeerConnection, s Signal) {
-	switch s.Type {
+func apply(pc *webrtc.PeerConnection, m signalMsg) {
+	switch m.Type {
 	case "offer":
-		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: s.SDP})
+		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: m.SDP})
 		ans, _ := pc.CreateAnswer(nil)
 		pc.SetLocalDescription(ans)
-		// Instead of pc.WriteRTCP(b), use signalAll with global variables.
-		signalAll(sigUdpConn, sigTopic, Signal{"answer", ans.SDP})
+		broadcast(signalMsg{"answer", ans.SDP})
 	case "answer":
-		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: s.SDP})
+		pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP})
 	}
 }
