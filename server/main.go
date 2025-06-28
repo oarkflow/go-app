@@ -420,12 +420,9 @@ func findSecret(cfg *Config) string {
 
 func createModelHandler(c *fiber.Ctx) error {
 
-	modelName := c.Params("model")
-	if modelName == "" {
-		if val := c.Locals("model"); val != nil {
-			modelName = val.(string)
-		}
-	}
+	// Replace manual extraction with the helper.
+	modelName := extractModelName(c)
+
 	m, ok := modelsMap[modelName]
 	if !ok {
 		return c.Status(404).JSON(fiber.Map{"error": "model not found"})
@@ -463,12 +460,7 @@ func createModelHandler(c *fiber.Ctx) error {
 }
 
 func readModelHandler(c *fiber.Ctx) error {
-	modelName := c.Params("model")
-	if modelName == "" {
-		if val := c.Locals("model"); val != nil {
-			modelName = val.(string)
-		}
-	}
+	modelName := extractModelName(c)
 	id := c.Params("id")
 	m, ok := modelsMap[modelName]
 	if !ok {
@@ -492,12 +484,7 @@ func readModelHandler(c *fiber.Ctx) error {
 }
 
 func updateModelHandler(c *fiber.Ctx) error {
-	modelName := c.Params("model")
-	if modelName == "" {
-		if val := c.Locals("model"); val != nil {
-			modelName = val.(string)
-		}
-	}
+	modelName := extractModelName(c)
 	id := c.Params("id")
 	m, ok := modelsMap[modelName]
 	if !ok {
@@ -524,7 +511,8 @@ func updateModelHandler(c *fiber.Ctx) error {
 	}
 	paramMap["id"] = id
 	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = :id", table, strings.Join(setClauses, ", "))
-	_, err := gDefaultDB.Exec(query, paramMap)
+	db := getModelDB(m) // using getModelDB instead of gDefaultDB directly.
+	_, err := db.Exec(query, paramMap)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -532,12 +520,7 @@ func updateModelHandler(c *fiber.Ctx) error {
 }
 
 func deleteModelHandler(c *fiber.Ctx) error {
-	modelName := c.Params("model")
-	if modelName == "" {
-		if val := c.Locals("model"); val != nil {
-			modelName = val.(string)
-		}
-	}
+	modelName := extractModelName(c)
 	id := c.Params("id")
 	m, ok := modelsMap[modelName]
 	if !ok {
@@ -558,13 +541,14 @@ func deleteModelHandler(c *fiber.Ctx) error {
 			break
 		}
 	}
+	db := getModelDB(m) // use the proper DB.
 	if softDelete {
 		query := fmt.Sprintf("UPDATE %s SET %s = :soft WHERE id = :id", table, softField)
 		paramMap["soft"] = true
-		_, err = gDefaultDB.Exec(query, paramMap)
+		_, err = db.Exec(query, paramMap)
 	} else {
 		query := fmt.Sprintf("DELETE FROM %s WHERE id = :id", table)
-		_, err = gDefaultDB.Exec(query, paramMap)
+		_, err = db.Exec(query, paramMap)
 	}
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "delete"})
@@ -573,12 +557,7 @@ func deleteModelHandler(c *fiber.Ctx) error {
 }
 
 func listModelHandler(c *fiber.Ctx) error {
-	modelName := c.Params("model")
-	if modelName == "" {
-		if val := c.Locals("model"); val != nil {
-			modelName = val.(string)
-		}
-	}
+	modelName := extractModelName(c)
 	m, ok := modelsMap[modelName]
 	if !ok {
 		return c.Status(404).JSON(fiber.Map{"error": "model not found"})
@@ -588,7 +567,8 @@ func listModelHandler(c *fiber.Ctx) error {
 		table = toName(modelName)
 	}
 	query := fmt.Sprintf("SELECT * FROM %s", table)
-	rows, err := gDefaultDB.Query(query, nil)
+	db := getModelDB(m) // use getModelDB instead of gDefaultDB.
+	rows, err := db.Query(query, nil)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "query list"})
 	}
@@ -626,6 +606,16 @@ func InitDB(name, driver, dsn string) (*squealx.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func extractModelName(c *fiber.Ctx) string {
+	modelName := c.Params("model")
+	if modelName == "" {
+		if val := c.Locals("model"); val != nil {
+			modelName = val.(string)
+		}
+	}
+	return modelName
 }
 
 func getModelDB(m ModelConfig) *squealx.DB {
