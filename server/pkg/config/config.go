@@ -78,21 +78,71 @@ type Response struct {
 	Fields []string `bcl:"fields"`
 }
 
+type ValidationRule struct {
+	Field    string   `bcl:"field"`
+	Required bool     `bcl:"required"`
+	Type     string   `bcl:"type"`
+	Enum     []string `bcl:"enum"`
+	Min      *int     `bcl:"min"`
+	Max      *int     `bcl:"max"`
+	Pattern  string   `bcl:"pattern"`
+}
+
+type Pagination struct {
+	Enabled   bool   `bcl:"enabled"`
+	PageField string `bcl:"page_field"`
+	SizeField string `bcl:"size_field"`
+	Default   int    `bcl:"default"`
+	Max       int    `bcl:"max"`
+}
+
+type Sorting struct {
+	Enabled    bool     `bcl:"enabled"`
+	Fields     []string `bcl:"fields"`
+	Default    string   `bcl:"default"`
+	AllowMulti bool     `bcl:"allow_multi"`
+}
+
+type ErrorFormat struct {
+	CodeField    string `bcl:"code_field"`
+	MessageField string `bcl:"message_field"`
+}
+
+type ResponseFormat struct {
+	Envelope string `bcl:"envelope"`
+}
+
+type Hook struct {
+	Type   string `bcl:"type"`   // pre, post
+	Script string `bcl:"script"` // path to script or inline
+}
+
 type Route struct {
-	Name       string   `bcl:"name"`
-	Group      string   `bcl:"group"`
-	Method     string   `bcl:"method"`
-	Path       string   `bcl:"path"`
-	Middleware []string `bcl:"middleware"`
-	Handler    string   `bcl:"handler"`
-	Request    Request  `bcl:"request"`
-	Response   Response `bcl:"response"`
+	Name           string           `bcl:"name"`
+	Group          string           `bcl:"group"`
+	Method         string           `bcl:"method"`
+	Path           string           `bcl:"path"`
+	Middleware     []string         `bcl:"middleware"`
+	Handler        string           `bcl:"handler"`
+	Request        Request          `bcl:"request"`
+	Response       Response         `bcl:"response"`
+	QueryParams    []string         `bcl:"query_params"`
+	Headers        []string         `bcl:"headers"`
+	Validation     []ValidationRule `bcl:"validation"`
+	Pagination     Pagination       `bcl:"pagination"`
+	Sorting        Sorting          `bcl:"sorting"`
+	ErrorFormat    ErrorFormat      `bcl:"error_format"`
+	ResponseFormat ResponseFormat   `bcl:"response_format"`
+	Hooks          []Hook           `bcl:"hooks"`
+	Version        string           `bcl:"version"`
 }
 
 type DAG struct {
-	Name string    `bcl:"name"`
-	Node []NodeRaw `bcl:"node"`
-	Edge []EdgeRaw `bcl:"edge"`
+	Name    string    `bcl:"name"`
+	Node    []NodeRaw `bcl:"node"`
+	Edge    []EdgeRaw `bcl:"edge"`
+	Version string    `bcl:"version"`
+	Hooks   []Hook    `bcl:"hooks"`
 }
 
 type NodeRaw struct {

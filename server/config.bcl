@@ -51,11 +51,23 @@ route "login" {
   method  = "POST"
   path    = "/login"
   handler = "loginHandler"
-  
+  validation = [
+    { field = "email", required = true, type = "string" },
+    { field = "password", required = true, type = "string" }
+  ]
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+  response_format {
+    envelope = "data"
+  }
+  version = "1"
+
   request {
     body = ["email", "password"]
   }
-  
+
   response {
     fields = ["token"]
   }
@@ -66,6 +78,16 @@ route "logout" {
   path       = "/logout"
   handler    = "logoutHandler"
   middleware = ["jwt"]
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+  response_format {
+    envelope = "data"
+  }
+  version = "1"
+
   response {
     fields = ["success"]
   }
@@ -76,6 +98,16 @@ route "profile" {
   path       = "/me"
   handler    = "profileHandler"
   middleware = ["jwt"]
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+  response_format {
+    envelope = "data"
+  }
+  version = "1"
+
   response {
     fields = ["user"]
   }
@@ -86,6 +118,16 @@ route "adminProfile" {
   method  = "GET"
   path    = "/profile"
   handler = "profileHandler"
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+  response_format {
+    envelope = "data"
+  }
+  version = "1"
+
   response {
     fields = ["user"]
   }
@@ -97,17 +139,18 @@ dag "loginHandler" {
     input  = ["email", "password"]
     output = ["user"]
   }
-  
+
   node "token" {
     type   = "auth_token"
     input  = ["user"]
     output = ["token"]
   }
-  
+
   edge {
     from = "verify"
     to   = "token"
   }
+  version = "1"
 }
 
 dag "logoutHandler" {
@@ -115,6 +158,7 @@ dag "logoutHandler" {
     type   = "auth_revoke"
     output = ["success"]
   }
+  version = "1"
 }
 
 dag "profileHandler" {
@@ -123,11 +167,12 @@ dag "profileHandler" {
     query    = "SELECT id, name, email FROM users WHERE id = :id"
     input    = ["ctx_userid"]
     field_mapping = {
-	  id    = "ctx_userid"
-	}
+      id    = "ctx_userid"
+    }
     output   = ["user"]
     provider = "master-sqlite"
   }
+  version = "1"
 }
 
 model "user" {

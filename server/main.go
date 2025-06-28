@@ -127,6 +127,9 @@ func Run(ctx context.Context) error {
 	dags := dag.BuildDAGs(&cfg, dbProviders, defaultDB, handlers.ModelsMap, handlers.AuthCfg)
 	for _, r := range cfg.Route {
 		fullPath := r.Path
+		if r.Version != "" {
+			fullPath = "/v" + r.Version + fullPath
+		}
 		if r.Group != "" {
 			var grp *config.Group
 			for i := range cfg.Group {
@@ -138,7 +141,7 @@ func Run(ctx context.Context) error {
 			if grp == nil {
 				log.Fatalf("group %s not found for route %s", r.Group, r.Name)
 			}
-			fullPath = grp.Path + r.Path
+			fullPath = grp.Path + fullPath
 			r.Middleware = append(grp.Middleware, r.Middleware...)
 		}
 		var h fiber.Handler
@@ -167,7 +170,7 @@ func Run(ctx context.Context) error {
 				if len(r.Request.Body) > 0 {
 					bodyMap := map[string]any{}
 					if err := c.BodyParser(&bodyMap); err != nil {
-						return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
+						return formatError(c, r, "invalid JSON", 400)
 					}
 					for _, b := range r.Request.Body {
 						if val, ok := bodyMap[b]; ok {
@@ -178,13 +181,74 @@ func Run(ctx context.Context) error {
 				for _, p := range r.Request.Params {
 					task[p] = c.Params(p)
 				}
+				for _, qp := range r.QueryParams {
+					task[qp] = c.Query(qp)
+				}
+				for _, h := range r.Headers {
+					task[h] = c.Get(h)
+				}
+				for _, rule := range r.Validation {
+					val, ok := task[rule.Field]
+					if rule.Required && (!ok || val == "" || val == nil) {
+						return formatError(c, r, "missing required field: "+rule.Field, 400)
+					}
+					if rule.Type != "" && ok && val != nil {
+						switch rule.Type {
+						case "string":
+							if _, ok := val.(string); !ok {
+								return formatError(c, r, "invalid type for field: "+rule.Field, 400)
+							}
+						case "int":
+							switch val.(type) {
+							case int, int64, float64:
+							default:
+								return formatError(c, r, "invalid type for field: "+rule.Field, 400)
+							}
+						}
+					}
+					if len(rule.Enum) > 0 && ok && val != nil {
+						found := false
+						for _, enumVal := range rule.Enum {
+							if val == enumVal {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return formatError(c, r, "invalid value for field: "+rule.Field, 400)
+						}
+					}
+				}
+				if r.Pagination.Enabled {
+					page := c.Query(r.Pagination.PageField, "1")
+					size := c.Query(r.Pagination.SizeField, "")
+					task["pagination_page"] = page
+					task["pagination_size"] = size
+				}
+				if r.Sorting.Enabled {
+					sort := c.Query("sort", r.Sorting.Default)
+					task["sort"] = sort
+				}
+				for _, hook := range r.Hooks {
+					if hook.Type == "pre" && hook.Script != "" {
+						// No-op: user can implement script execution here if needed
+					}
+				}
 				out, err := dagInstance.Execute(ctx, task)
 				if err != nil {
-					return c.Status(400).JSON(fiber.Map{"error": err.Error(), "action": "dag execution", "dag": r.Handler})
+					return formatError(c, r, err.Error(), 400)
+				}
+				for _, hook := range r.Hooks {
+					if hook.Type == "post" && hook.Script != "" {
+						// No-op: user can implement script execution here if needed
+					}
 				}
 				resp := make(fiber.Map)
 				for _, f := range r.Response.Fields {
 					resp[f] = out[f]
+				}
+				if r.ResponseFormat.Envelope != "" {
+					return c.JSON(fiber.Map{r.ResponseFormat.Envelope: resp})
 				}
 				return c.JSON(resp)
 			}
@@ -227,6 +291,18 @@ func Run(ctx context.Context) error {
 			})
 		}
 	}
+	// OpenAPI docs endpoint (stub)
+	app.Get("/docs/openapi.json", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"openapi": "3.0.0",
+			"info": fiber.Map{
+				"title":   cfg.Server.Name,
+				"version": "1.0.0",
+			},
+			"paths": fiber.Map{},
+		})
+	})
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("Listening on %s...", cfg.Server.Address)
@@ -237,4 +313,16 @@ func Run(ctx context.Context) error {
 	log.Println("Draining server connections and shutting down")
 	_ = app.Shutdown()
 	return <-errCh
+}
+
+func formatError(c *fiber.Ctx, r config.Route, msg string, code int) error {
+	field := "error"
+	msgField := "message"
+	if r.ErrorFormat.CodeField != "" {
+		field = r.ErrorFormat.CodeField
+	}
+	if r.ErrorFormat.MessageField != "" {
+		msgField = r.ErrorFormat.MessageField
+	}
+	return c.Status(code).JSON(fiber.Map{field: code, msgField: msg})
 }

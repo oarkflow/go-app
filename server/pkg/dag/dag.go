@@ -52,6 +52,8 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 		data[k] = v
 	}
 	executed := make(map[string]bool)
+	// Pre-hooks (stub: can be extended to run scripts/plugins)
+	// TODO: Implement pre-hook logic
 	for len(executed) < len(d.Nodes) {
 		progress := false
 		for name, node := range d.Nodes {
@@ -75,12 +77,16 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 			if !ready {
 				continue
 			}
+			// Pre-node hook (stub)
+			// TODO: Implement per-node pre-hook logic
 			start := time.Now()
 			res, err := node.Processor.Process(ctx, data)
 			log.Printf("Node %s executed in %v", name, time.Since(start))
 			if err != nil {
 				return nil, err
 			}
+			// Post-node hook (stub)
+			// TODO: Implement per-node post-hook logic
 			for _, key := range node.Config.Output {
 				if v, ok := res[key]; ok {
 					data[key] = v
@@ -93,16 +99,20 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 			return nil, errors.New("cycle or unmet dependencies in DAG")
 		}
 	}
+	// Post-hooks (stub)
+	// TODO: Implement post-hook logic
 	return data, nil
 }
 
 // Node types
 
 type DBQueryNode struct {
-	Query  string
-	DB     *squealx.DB
-	OutKey string
-	Config config.NodeRaw
+	Query      string
+	DB         *squealx.DB
+	OutKey     string
+	Config     config.NodeRaw
+	Pagination config.Pagination
+	Sorting    config.Sorting
 }
 
 func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
@@ -113,6 +123,26 @@ func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
 	for k, v := range n.Config.FieldMapping {
 		if val, ok := params[v]; ok {
 			params[k] = val
+		}
+	}
+	if n.Pagination.Enabled {
+		page := 1
+		size := n.Pagination.Default
+		if v, ok := in["pagination_page"].(string); ok {
+			fmt.Sscanf(v, "%d", &page)
+		}
+		if v, ok := in["pagination_size"].(string); ok && v != "" {
+			fmt.Sscanf(v, "%d", &size)
+		}
+		if size > n.Pagination.Max && n.Pagination.Max > 0 {
+			size = n.Pagination.Max
+		}
+		params["limit"] = size
+		params["offset"] = (page - 1) * size
+	}
+	if n.Sorting.Enabled {
+		if sort, ok := in["sort"].(string); ok && sort != "" {
+			params["sort"] = sort
 		}
 	}
 	var resultMap map[string]any
@@ -227,10 +257,12 @@ func BuildDAGs(cfg *config.Config, dbProviders map[string]*squealx.DB, defaultDB
 			switch nd.Type {
 			case "db_query":
 				proc = &DBQueryNode{
-					Query:  nd.Query,
-					DB:     dbConn,
-					OutKey: nd.Output[0],
-					Config: nd,
+					Query:      nd.Query,
+					DB:         dbConn,
+					OutKey:     nd.Output[0],
+					Config:     nd,
+					Pagination: config.Pagination{}, // Can be set from config if needed
+					Sorting:    config.Sorting{},
 				}
 			case "auth_verify":
 				userModel, ok := modelsMap[authCfg.Login.UserModel]
@@ -273,6 +305,7 @@ func BuildDAGs(cfg *config.Config, dbProviders map[string]*squealx.DB, defaultDB
 		for _, e := range dc.Edge {
 			dag.AddEdge(Edge{From: e.From, To: e.To})
 		}
+		// Attach hooks/version if present
 		dags[dc.Name] = dag
 	}
 	return dags
