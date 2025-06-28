@@ -2,6 +2,13 @@ server {
   address = "0.0.0.0:8080"
 }
 
+provider "master-sqlite" {
+  driver  = "sqlite"
+  type = "database"
+  dsn     = "file:app.db?cache=shared&mode=rwc"
+  default = true
+}
+
 middleware "log" {
   type   = "logger"
   global = true
@@ -32,9 +39,6 @@ route "logout" {
   path       = "/logout"
   handler    = "logoutHandler"
   middleware = ["jwt"]
-
-  request {}
-
   response {
     fields = ["success"]
   }
@@ -45,9 +49,6 @@ route "profile" {
   path       = "/me"
   handler    = "profileHandler"
   middleware = ["jwt"]
-
-  request {}
-
   response {
     fields = ["user"]
   }
@@ -75,7 +76,6 @@ dag "loginHandler" {
 dag "logoutHandler" {
   node "revoke" {
     type   = "auth_revoke"
-    input  = []
     output = ["success"]
   }
 }
@@ -86,5 +86,6 @@ dag "profileHandler" {
     query  = "SELECT id, name, email FROM users WHERE id = ?"
     input  = ["ctx_userid"]
     output = ["user"]
+    provider = "master-sqlite"
   }
 }

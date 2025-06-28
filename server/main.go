@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log"
 	"os"
@@ -15,14 +14,24 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/oarkflow/bcl"
+	"github.com/oarkflow/squealx"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
 /* --- CONFIG STRUCTS --- */
 
+type ProviderConfig struct {
+	Name    string `bcl:"name"`
+	Driver  string `bcl:"driver"`
+	Type    string `bcl:"type"`
+	DSN     string `bcl:"dsn"`
+	Default bool   `bcl:"default,optional"`
+}
+
 type Config struct {
 	Server     ServerConfig       `bcl:"server"`
+	Provider   []ProviderConfig   `bcl:"provider"`
 	Middleware []MiddlewareConfig `bcl:"middleware"`
 	Route      []RouteConfig      `bcl:"route"`
 	DAG        []DAGConfig        `bcl:"dag"`
@@ -61,11 +70,12 @@ type DAGConfig struct {
 }
 
 type NodeConfigRaw struct {
-	Name   string   `bcl:"name"`
-	Type   string   `bcl:"type"`
-	Query  string   `bcl:"query,optional"`
-	Input  []string `bcl:"input,optional"`
-	Output []string `bcl:"output"`
+	Name     string   `bcl:"name"`
+	Type     string   `bcl:"type"`
+	Query    string   `bcl:"query,optional"`
+	Input    []string `bcl:"input,optional"`
+	Output   []string `bcl:"output"`
+	Provider string   `bcl:"provider,optional"`
 }
 
 type EdgeRaw struct {
@@ -75,8 +85,9 @@ type EdgeRaw struct {
 
 /* --- DB INIT --- */
 
-func InitDB(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dsn)
+// Refactored InitDB to accept a driver parameter from config.bcl.
+func InitDB(name, driver, dsn string) (*squealx.DB, error) {
+	db, err := squealx.Open(driver, dsn, name)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +202,7 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 
 type DBQueryNode struct {
 	Query  string
-	DB     *sql.DB
+	DB     *squealx.DB
 	OutKey string
 }
 
@@ -200,12 +211,16 @@ func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
 	for _, k := range nQueryParams(in, n.Query) {
 		params = append(params, in[k])
 	}
-	row := n.DB.QueryRow(n.Query, params...)
-	var id, name, email string
-	if err := row.Scan(&id, &name, &email); err != nil {
+	// use sqlx Get to retrieve into a struct
+	var user struct {
+		ID    string `db:"id"`
+		Name  string `db:"name"`
+		Email string `db:"email"`
+	}
+	if err := n.DB.Get(&user, n.Query, params...); err != nil {
 		return nil, err
 	}
-	return Result{n.OutKey: map[string]string{"id": id, "name": name, "email": email}}, nil
+	return Result{n.OutKey: map[string]string{"id": user.ID, "name": user.Name, "email": user.Email}}, nil
 }
 
 func nQueryParams(in Task, query string) []string {
@@ -222,24 +237,27 @@ func nQueryParams(in Task, query string) []string {
 }
 
 type AuthVerifyNode struct {
-	DB *sql.DB
+	DB *squealx.DB
 }
 
 func (n *AuthVerifyNode) Process(_ context.Context, in Task) (Result, error) {
 	email := in["email"].(string)
 	pass := in["password"].(string)
-	var id, hash string
-	if err := n.DB.QueryRow("SELECT id,password FROM users WHERE email=?", email).Scan(&id, &hash); err != nil {
+	var user struct {
+		ID       string `db:"id"`
+		Password string `db:"password"`
+	}
+	if err := n.DB.Get(&user, "SELECT id,password FROM users WHERE email=?", email); err != nil {
 		return nil, err
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) != nil {
+	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(pass)) != nil {
 		return nil, errors.New("invalid credentials")
 	}
-	return Result{"user": id}, nil
+	return Result{"user": user.ID}, nil
 }
 
 type AuthTokenNode struct {
-	DB         *sql.DB
+	DB         *squealx.DB
 	JWTSecret  []byte
 	TTLSeconds int64
 }
@@ -261,7 +279,7 @@ func (n *AuthTokenNode) Process(_ context.Context, in Task) (Result, error) {
 }
 
 type AuthRevokeNode struct {
-	DB *sql.DB
+	DB *squealx.DB
 }
 
 func (n *AuthRevokeNode) Process(ctx context.Context, _ Task) (Result, error) {
@@ -292,22 +310,33 @@ func WithJWT(secret []byte) fiber.Handler {
 
 /* --- BUILD DAGs FROM CONFIG --- */
 
-func buildDAGs(cfg *Config, db *sql.DB) map[string]*DAG {
+func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squealx.DB) map[string]*DAG {
 	dags := make(map[string]*DAG)
 	secret := findSecret(cfg)
 	for _, dc := range cfg.DAG {
 		dag := NewDAG()
 		for _, nd := range dc.Node {
+			// Select DB from node's provider if available
+			var dbConn *squealx.DB
+			if nd.Provider != "" {
+				var ok bool
+				dbConn, ok = dbProviders[nd.Provider]
+				if !ok {
+					log.Fatalf("provider %s not found for node %s", nd.Provider, nd.Name)
+				}
+			} else {
+				dbConn = defaultDB
+			}
 			var proc NodeProcessor
 			switch nd.Type {
 			case "db_query":
-				proc = &DBQueryNode{Query: nd.Query, DB: db, OutKey: nd.Output[0]}
+				proc = &DBQueryNode{Query: nd.Query, DB: dbConn, OutKey: nd.Output[0]}
 			case "auth_verify":
-				proc = &AuthVerifyNode{DB: db}
+				proc = &AuthVerifyNode{DB: dbConn}
 			case "auth_token":
-				proc = &AuthTokenNode{DB: db, JWTSecret: []byte(secret), TTLSeconds: 3600}
+				proc = &AuthTokenNode{DB: dbConn, JWTSecret: []byte(secret), TTLSeconds: 3600}
 			case "auth_revoke":
-				proc = &AuthRevokeNode{DB: db}
+				proc = &AuthRevokeNode{DB: dbConn}
 			default:
 				log.Fatalf("unsupported node type %s", nd.Type)
 			}
@@ -348,9 +377,21 @@ func main() {
 		log.Fatal("bcl parse:", err)
 	}
 
-	db, err := InitDB("file:app.db?cache=shared&mode=rwc")
-	if err != nil {
-		log.Fatal("db init:", err)
+	// Initialize DB connections for each provider from config using the driver field
+	dbProviders := make(map[string]*squealx.DB)
+	var defaultDB *squealx.DB
+	for _, p := range cfg.Provider {
+		dbConn, err := InitDB(p.Name, p.Driver, p.DSN)
+		if err != nil {
+			log.Fatalf("db init for provider %s: %v", p.Name, err)
+		}
+		dbProviders[p.Name] = dbConn
+		if p.Default {
+			defaultDB = dbConn
+		}
+	}
+	if defaultDB == nil {
+		log.Fatal("no default database provider found in config")
 	}
 
 	app := fiber.New()
@@ -374,7 +415,7 @@ func main() {
 		}
 	}
 
-	dags := buildDAGs(&cfg, db)
+	dags := buildDAGs(&cfg, dbProviders, defaultDB)
 	for _, r := range cfg.Route {
 		dag := dags[r.Handler]
 		h := func(c *fiber.Ctx) error {
