@@ -20,7 +20,7 @@ middleware "jwt" {
   secret = "supersecret"
 }
 
-global_middleware = ["log", "jwt"]
+global_middleware = ["log"]
 
 group "admin" {
   path       = "/admin"
@@ -106,4 +106,16 @@ dag "profileHandler" {
     output   = ["user"]
     provider = "master-sqlite"
   }
+}
+
+model "user" {
+	table = "users"
+	rest  = true
+    prefix = "users"  // optional prefix for CRUD routes; if omitted, system will pluralize "user" to "users"
+	fields = [
+	  { name = "id", data_type = "TEXT" },
+	  { name = "name", data_type = "TEXT" },
+	  { name = "email", data_type = "TEXT" },
+	  { name = "password", data_type = "TEXT" }
+	]
 }
