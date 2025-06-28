@@ -1,0 +1,90 @@
+server {
+  address = "0.0.0.0:8080"
+}
+
+middleware "log" {
+  type   = "logger"
+  global = true
+}
+
+middleware "jwt" {
+  type   = "jwt"
+  secret = "supersecret"
+  global = false
+}
+
+route "login" {
+  method  = "POST"
+  path    = "/login"
+  handler = "loginHandler"
+
+  request {
+    body = ["email", "password"]
+  }
+
+  response {
+    fields = ["token"]
+  }
+}
+
+route "logout" {
+  method     = "POST"
+  path       = "/logout"
+  handler    = "logoutHandler"
+  middleware = ["jwt"]
+
+  request {}
+
+  response {
+    fields = ["success"]
+  }
+}
+
+route "profile" {
+  method     = "GET"
+  path       = "/me"
+  handler    = "profileHandler"
+  middleware = ["jwt"]
+
+  request {}
+
+  response {
+    fields = ["user"]
+  }
+}
+
+dag "loginHandler" {
+  node "verify" {
+    type   = "auth_verify"
+    input  = ["email", "password"]
+    output = ["user"]
+  }
+
+  node "token" {
+    type   = "auth_token"
+    input  = ["user"]
+    output = ["token"]
+  }
+
+  edge {
+    from = "verify"
+    to   = "token"
+  }
+}
+
+dag "logoutHandler" {
+  node "revoke" {
+    type   = "auth_revoke"
+    input  = []
+    output = ["success"]
+  }
+}
+
+dag "profileHandler" {
+  node "fetch" {
+    type   = "db_query"
+    query  = "SELECT id, name, email FROM users WHERE id = ?"
+    input  = ["ctx_userid"]
+    output = ["user"]
+  }
+}

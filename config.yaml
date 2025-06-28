@@ -1,0 +1,79 @@
+# config.yaml
+port: 8080
+tls_enabled: false
+shutdown_timeout: 15s
+
+static:
+  - prefix: "/assets"
+    dir: "./public"
+
+templates:
+  dir: "./views"
+  pattern: "*.html"
+
+middlewares:
+  - "Logger"
+  - "Timeout"
+  - "Auth" # additional middleware
+
+groups:
+  - name: "public"
+    prefix: ""
+    middlewares: []
+  - name: "admin"
+    prefix: "/admin"
+    middlewares:
+      - "Auth"
+
+routes:
+  - method: "GET"
+    path: "/"
+    handler: "RenderHome"
+    template: "home" # custom property for template rendering
+    group: "public" # assign route to a group
+    middlewares: [] # route-based middlewares if any
+  - method: "POST"
+    path: "/v1/users"
+    handler: "CreateUser"
+    request_schema: "schemas/create-user.json"
+    response_schema: "schemas/user.json"
+    group: "public"
+    middlewares: ["Example"] # example of route-specific middleware
+  - method: "GET"
+    path: "/v1/users/:id"
+    handler: "GetUser"
+    response_schema: "schemas/user.json"
+    auth_required: true
+    group: "public"
+    middlewares: ["Auth"]
+
+handlers:
+  - name: "CreateUser"
+    nodes:
+      - id: "1"
+        func: "Validate"
+      - id: "2"
+        func: "BusinessLogic"
+      - id: "3"
+        func: "AfterCreate" # new function specific to create route
+    edges:
+      - from: "1"
+        to: "2"
+      - from: "2"
+        to: "3"
+
+  - name: "GetUser"
+    nodes:
+      - id: "1"
+        func: "FetchUser" # new function specific to fetch route
+      - id: "2"
+        func: "Respond"
+    edges:
+      - from: "1"
+        to: "2"
+
+  - name: "RenderHome"
+    nodes:
+      - id: "1"
+        func: "RenderTemplate" # function to render a template
+    edges: []
