@@ -26,13 +26,14 @@ type ProviderConfig struct {
 	Driver  string `bcl:"driver"`
 	Type    string `bcl:"type"`
 	DSN     string `bcl:"dsn"`
-	Default bool   `bcl:"default,optional"`
+	Default bool   `bcl:"default"`
 }
 
 type Config struct {
 	Server     ServerConfig       `bcl:"server"`
 	Provider   []ProviderConfig   `bcl:"provider"`
 	Middleware []MiddlewareConfig `bcl:"middleware"`
+	Group      []GroupConfig      `bcl:"group"`
 	Route      []RouteConfig      `bcl:"route"`
 	DAG        []DAGConfig        `bcl:"dag"`
 }
@@ -44,19 +45,26 @@ type ServerConfig struct {
 type MiddlewareConfig struct {
 	Name   string `bcl:"name"`
 	Type   string `bcl:"type"`
-	Secret string `bcl:"secret,optional"`
-	Global bool   `bcl:"global,optional"`
+	Secret string `bcl:"secret"`
+	Global bool   `bcl:"global"`
+}
+
+type GroupConfig struct {
+	Name       string   `bcl:"name"`
+	Path       string   `bcl:"path"`
+	Middleware []string `bcl:"middleware"`
 }
 
 type RouteConfig struct {
 	Name       string   `bcl:"name"`
+	Group      string   `bcl:"group"`
 	Method     string   `bcl:"method"`
 	Path       string   `bcl:"path"`
-	Middleware []string `bcl:"middleware,optional"`
+	Middleware []string `bcl:"middleware"`
 	Handler    string   `bcl:"handler"`
 	Request    struct {
-		Body   []string `bcl:"body,optional"`
-		Params []string `bcl:"params,optional"`
+		Body   []string `bcl:"body"`
+		Params []string `bcl:"params"`
 	} `bcl:"request"`
 	Response struct {
 		Fields []string `bcl:"fields"`
@@ -72,10 +80,10 @@ type DAGConfig struct {
 type NodeConfigRaw struct {
 	Name     string   `bcl:"name"`
 	Type     string   `bcl:"type"`
-	Query    string   `bcl:"query,optional"`
-	Input    []string `bcl:"input,optional"`
+	Query    string   `bcl:"query"`
+	Input    []string `bcl:"input"`
 	Output   []string `bcl:"output"`
-	Provider string   `bcl:"provider,optional"`
+	Provider string   `bcl:"provider"`
 }
 
 type EdgeRaw struct {
@@ -377,7 +385,7 @@ func main() {
 		log.Fatal("bcl parse:", err)
 	}
 
-	// Initialize DB connections for each provider from config using the driver field
+	// Initialize DB connections for providers using driver from config
 	dbProviders := make(map[string]*squealx.DB)
 	var defaultDB *squealx.DB
 	for _, p := range cfg.Provider {
@@ -416,7 +424,26 @@ func main() {
 	}
 
 	dags := buildDAGs(&cfg, dbProviders, defaultDB)
+
+	// Modified route registration to support groups.
 	for _, r := range cfg.Route {
+		fullPath := r.Path
+		if r.Group != "" {
+			var grp *GroupConfig
+			for i := range cfg.Group {
+				if cfg.Group[i].Name == r.Group {
+					grp = &cfg.Group[i]
+					break
+				}
+			}
+			if grp == nil {
+				log.Fatalf("group %s not found for route %s", r.Group, r.Name)
+			}
+			fullPath = grp.Path + r.Path
+			// Prepend group's middleware to route middleware list.
+			r.Middleware = append(grp.Middleware, r.Middleware...)
+		}
+
 		dag := dags[r.Handler]
 		h := func(c *fiber.Ctx) error {
 			ctx := context.Background()
@@ -426,8 +453,7 @@ func main() {
 			if u := c.Locals("ctx_userid"); u != nil {
 				ctx = context.WithValue(ctx, "ctx_userid", u.(string))
 			}
-
-			task := Task{}
+			task := make(Task)
 			if len(r.Request.Body) > 0 {
 				bodyMap := map[string]interface{}{}
 				if err := c.BodyParser(&bodyMap); err != nil {
@@ -442,18 +468,16 @@ func main() {
 			for _, p := range r.Request.Params {
 				task[p] = c.Params(p)
 			}
-
 			out, err := dag.Execute(ctx, task)
 			if err != nil {
 				return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 			}
-			resp := fiber.Map{}
+			resp := make(fiber.Map)
 			for _, f := range r.Response.Fields {
 				resp[f] = out[f]
 			}
 			return c.JSON(resp)
 		}
-
 		var stack []fiber.Handler
 		for _, mw := range r.Middleware {
 			if fn, ok := globalMW[mw]; ok {
@@ -461,7 +485,7 @@ func main() {
 			}
 		}
 		stack = append(stack, h)
-		app.Add(strings.ToUpper(r.Method), r.Path, stack...)
+		app.Add(strings.ToUpper(r.Method), fullPath, stack...)
 	}
 
 	log.Printf("Listening on %s...", cfg.Server.Address)

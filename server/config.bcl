@@ -20,6 +20,11 @@ middleware "jwt" {
   global = false
 }
 
+group "admin" {
+  path       = "/admin"
+  middleware = ["log"]
+}
+
 route "login" {
   method  = "POST"
   path    = "/login"
@@ -54,6 +59,17 @@ route "profile" {
   }
 }
 
+route "adminProfile" {
+  group     = "admin"
+  method    = "GET"
+  path      = "/profile"
+  handler   = "profileHandler"
+  middleware = ["jwt"]
+  response {
+    fields = ["user"]
+  }
+}
+
 dag "loginHandler" {
   node "verify" {
     type   = "auth_verify"
@@ -82,10 +98,10 @@ dag "logoutHandler" {
 
 dag "profileHandler" {
   node "fetch" {
-    type   = "db_query"
-    query  = "SELECT id, name, email FROM users WHERE id = ?"
-    input  = ["ctx_userid"]
-    output = ["user"]
+    type     = "db_query"
+    query    = "SELECT id, name, email FROM users WHERE id = ?"
+    input    = ["ctx_userid"]
+    output   = ["user"]
     provider = "master-sqlite"
   }
 }
