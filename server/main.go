@@ -136,17 +136,15 @@ type ModelField struct {
 	SoftDelete bool   `bcl:"soft_delete"`
 }
 
-type Task = map[string]interface{}
-type Result = map[string]interface{}
+type Task = map[string]any
+type Result = map[string]any
 
 type NodeProcessor interface {
 	Process(ctx context.Context, input Task) (Result, error)
 }
 
 type NodeConfig struct {
-	Name      string
-	Input     []string
-	Output    []string
+	Config    NodeConfigRaw
 	Processor NodeProcessor
 }
 
@@ -162,7 +160,7 @@ func NewDAG() *DAG {
 }
 
 func (d *DAG) AddNode(cfg *NodeConfig) {
-	d.Nodes[cfg.Name] = cfg
+	d.Nodes[cfg.Config.Name] = cfg
 }
 
 func (d *DAG) AddEdge(e Edge) {
@@ -181,7 +179,7 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 			if executed[name] {
 				continue
 			}
-			for _, inKey := range node.Input {
+			for _, inKey := range node.Config.Input {
 				if _, ok := data[inKey]; !ok {
 					if v := ctx.Value(inKey); v != nil {
 						data[inKey] = v
@@ -189,7 +187,7 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 				}
 			}
 			ready := true
-			for _, inKey := range node.Input {
+			for _, inKey := range node.Config.Input {
 				if _, ok := data[inKey]; !ok {
 					ready = false
 					break
@@ -202,7 +200,7 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 			if err != nil {
 				return nil, err
 			}
-			for _, key := range node.Output {
+			for _, key := range node.Config.Output {
 				if v, ok := res[key]; ok {
 					data[key] = v
 				}
@@ -218,54 +216,38 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 }
 
 type DBQueryNode struct {
-	Query              string
-	DB                 *squealx.DB
-	OutKey             string
-	FieldMapping       map[string]string
-	InsertFieldMapping map[string]string
-	UpdateFieldMapping map[string]string
-	QueryFieldMapping  map[string]string
+	Query  string
+	DB     *squealx.DB
+	OutKey string
+	Config NodeConfigRaw
 }
 
 func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
-	var params []interface{}
-	for _, k := range nQueryParams(in, n.Query) {
-		params = append(params, in[k])
+	params := make(map[string]any)
+	for k, v := range in {
+		params[k] = v
 	}
-	var user struct {
-		ID    string `db:"id"`
-		Name  string `db:"name"`
-		Email string `db:"email"`
+	for k, v := range n.Config.FieldMapping {
+		if val, ok := params[v]; ok {
+			params[k] = val
+		}
 	}
-	if err := n.DB.Get(&user, n.Query, params...); err != nil {
+	var resultMap map[string]any
+	if err := n.DB.Select(&resultMap, n.Query, params); err != nil {
 		return nil, err
 	}
-	result := Result{n.OutKey: map[string]string{"id": user.ID, "name": user.Name, "email": user.Email}}
-	if n.QueryFieldMapping != nil && len(n.QueryFieldMapping) > 0 {
-		orig := result[n.OutKey].(map[string]string)
-		mapped := make(map[string]string)
-		for k, v := range orig {
-			if newKey, ok := n.QueryFieldMapping[k]; ok {
+	if n.Config.QueryFieldMapping != nil && len(n.Config.QueryFieldMapping) > 0 {
+		mapped := make(map[string]any)
+		for k, v := range resultMap {
+			if newKey, ok := n.Config.QueryFieldMapping[k]; ok {
 				mapped[newKey] = v
 			} else {
 				mapped[k] = v
 			}
 		}
-		result[n.OutKey] = mapped
+		resultMap = mapped
 	}
-	return result, nil
-}
-
-func nQueryParams(in Task, query string) []string {
-	count := strings.Count(query, "?")
-	var keys []string
-	for k := range in {
-		keys = append(keys, k)
-		if len(keys) == count {
-			break
-		}
-	}
-	return keys
+	return Result{n.OutKey: resultMap}, nil
 }
 
 type AuthVerifyNode struct {
@@ -274,40 +256,41 @@ type AuthVerifyNode struct {
 	PasswordField   string
 	UserTable       string
 	CredentialTable string
+	Config          NodeConfigRaw
 }
 
 func (n *AuthVerifyNode) Process(_ context.Context, in Task) (Result, error) {
-
 	username, ok := in[authCfg.Login.UsernameField].(string)
 	if !ok {
 		return nil, fmt.Errorf("username field %s missing or invalid", authCfg.Login.UsernameField)
 	}
-	userQuery := fmt.Sprintf("SELECT id FROM %s WHERE %s = ?", n.UserTable, n.UsernameField)
-	var userID string
-	if err := n.DB.QueryRow(userQuery, username).Scan(&userID); err != nil {
+	userQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s = :username", n.UserTable, n.UsernameField)
+	userParams := map[string]any{"username": username}
+	var user map[string]any
+	if err := n.DB.Select(&user, userQuery, userParams); err != nil {
 		return nil, fmt.Errorf("user not found or error: %v", err)
 	}
-
-	credQuery := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", n.PasswordField, n.CredentialTable)
-	var storedPass string
-	if err := n.DB.QueryRow(credQuery, userID).Scan(&storedPass); err != nil {
+	credQuery := fmt.Sprintf("SELECT * FROM %s WHERE id = :id", n.CredentialTable)
+	var storagePass map[string]any
+	if err := n.DB.Select(&storagePass, credQuery, user); err != nil {
 		return nil, fmt.Errorf("credentials not found or error: %v", err)
 	}
-
 	pass, ok := in[authCfg.Login.PasswordField].(string)
 	if !ok {
 		return nil, fmt.Errorf("password field %s missing", authCfg.Login.PasswordField)
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(storedPass), []byte(pass)); err != nil {
+	dbPass, ok := storagePass[n.PasswordField].(string)
+	if err := bcrypt.CompareHashAndPassword([]byte(dbPass), []byte(pass)); err != nil {
 		return nil, errors.New("invalid credentials")
 	}
-	return Result{"user": userID}, nil
+	return Result{"user": user["id"]}, nil
 }
 
 type AuthTokenNode struct {
 	DB         *squealx.DB
 	JWTSecret  []byte
 	TTLSeconds int64
+	Config     NodeConfigRaw
 }
 
 func (n *AuthTokenNode) Process(_ context.Context, in Task) (Result, error) {
@@ -327,7 +310,8 @@ func (n *AuthTokenNode) Process(_ context.Context, in Task) (Result, error) {
 }
 
 type AuthRevokeNode struct {
-	DB *squealx.DB
+	DB     *squealx.DB
+	Config NodeConfigRaw
 }
 
 func (n *AuthRevokeNode) Process(ctx context.Context, _ Task) (Result, error) {
@@ -374,16 +358,12 @@ func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squea
 			switch nd.Type {
 			case "db_query":
 				proc = &DBQueryNode{
-					Query:              nd.Query,
-					DB:                 dbConn,
-					OutKey:             nd.Output[0],
-					FieldMapping:       nd.FieldMapping,
-					InsertFieldMapping: nd.InsertFieldMapping,
-					UpdateFieldMapping: nd.UpdateFieldMapping,
-					QueryFieldMapping:  nd.QueryFieldMapping,
+					Query:  nd.Query,
+					DB:     dbConn,
+					OutKey: nd.Output[0],
+					Config: nd,
 				}
 			case "auth_verify":
-
 				userModel, ok := modelsMap[authCfg.Login.UserModel]
 				if !ok {
 					log.Fatalf("user model %s not found", authCfg.Login.UserModel)
@@ -406,6 +386,7 @@ func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squea
 					PasswordField:   authCfg.Login.PasswordField,
 					UserTable:       userTable,
 					CredentialTable: credTable,
+					Config:          nd,
 				}
 			case "auth_token":
 				proc = &AuthTokenNode{DB: dbConn, JWTSecret: []byte(secret), TTLSeconds: 3600}
@@ -415,10 +396,8 @@ func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squea
 				log.Fatalf("unsupported node type %s", nd.Type)
 			}
 			dag.AddNode(&NodeConfig{
-				Name:      nd.Name,
-				Input:     nd.Input,
-				Output:    nd.Output,
 				Processor: proc,
+				Config:    nd,
 			})
 		}
 		for _, e := range dc.Edge {
@@ -451,7 +430,7 @@ func createModelHandler(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(404).JSON(fiber.Map{"error": "model not found"})
 	}
-	var payload map[string]interface{}
+	var payload map[string]any
 	if err := c.BodyParser(&payload); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
 	}
@@ -459,22 +438,23 @@ func createModelHandler(c *fiber.Ctx) error {
 	if table == "" {
 		table = toName(modelName)
 	}
+	// Build column lists and a parameter map for named placeholders.
 	var cols []string
-	var placeholders []string
-	var values []interface{}
+	paramMap := make(map[string]any)
 	for _, field := range m.Fields {
 		if v, exists := payload[field.Name]; exists {
 			cols = append(cols, field.Name)
-			placeholders = append(placeholders, "?")
-			values = append(values, v)
+			paramMap[field.Name] = v
 		}
 	}
 	if len(cols) == 0 {
 		return c.Status(400).JSON(fiber.Map{"error": "no valid fields provided"})
 	}
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	// Build query using named parameters.
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "),
+		":"+strings.Join(cols, ", :"))
 	db := getModelDB(m)
-	res, err := db.Exec(query, values...)
+	res, err := db.Exec(query, paramMap)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -498,28 +478,17 @@ func readModelHandler(c *fiber.Ctx) error {
 	if table == "" {
 		table = toName(modelName)
 	}
-	query := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
-	row := gDefaultDB.QueryRow(query, id)
-	result := make(map[string]interface{})
-	var cols []string
-	for _, f := range m.Fields {
-		cols = append(cols, f.Name)
-		result[f.Name] = new(interface{})
-	}
-	var args []interface{}
-	for _, f := range m.Fields {
-		args = append(args, result[f.Name])
-	}
-	if err := row.Scan(args...); err != nil {
+	db := getModelDB(m)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE id = :id", table)
+	var result map[string]any
+	err := db.Select(&result, query, map[string]any{"id": id})
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.Status(404).JSON(fiber.Map{"error": "record not found"})
 		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
-	for k, v := range result {
-		result[k] = *(v.(*interface{}))
-	}
-	return c.JSON(fiber.Map{"record": result})
+	return c.JSON(fiber.Map{"data": result})
 }
 
 func updateModelHandler(c *fiber.Ctx) error {
@@ -538,24 +507,24 @@ func updateModelHandler(c *fiber.Ctx) error {
 	if table == "" {
 		table = toName(modelName)
 	}
-	var payload map[string]interface{}
+	var payload map[string]any
 	if err := c.BodyParser(&payload); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
 	}
-	var sets []string
-	var values []interface{}
+	setClauses := []string{}
+	paramMap := make(map[string]any)
 	for _, field := range m.Fields {
 		if v, exists := payload[field.Name]; exists {
-			sets = append(sets, fmt.Sprintf("%s = ?", field.Name))
-			values = append(values, v)
+			setClauses = append(setClauses, fmt.Sprintf("%s = :%s", field.Name, field.Name))
+			paramMap[field.Name] = v
 		}
 	}
-	if len(sets) == 0 {
+	if len(setClauses) == 0 {
 		return c.Status(400).JSON(fiber.Map{"error": "no valid fields to update"})
 	}
-	values = append(values, id)
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", table, strings.Join(sets, ", "))
-	_, err := gDefaultDB.Exec(query, values...)
+	paramMap["id"] = id
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = :id", table, strings.Join(setClauses, ", "))
+	_, err := gDefaultDB.Exec(query, paramMap)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -578,6 +547,8 @@ func deleteModelHandler(c *fiber.Ctx) error {
 	if table == "" {
 		table = toName(modelName)
 	}
+	paramMap := map[string]any{"id": id}
+	var err error
 	softDelete := false
 	var softField string
 	for _, field := range m.Fields {
@@ -587,16 +558,16 @@ func deleteModelHandler(c *fiber.Ctx) error {
 			break
 		}
 	}
-	var err error
 	if softDelete {
-		query := fmt.Sprintf("UPDATE %s SET %s = ? WHERE id = ?", table, softField)
-		_, err = gDefaultDB.Exec(query, true, id)
+		query := fmt.Sprintf("UPDATE %s SET %s = :soft WHERE id = :id", table, softField)
+		paramMap["soft"] = true
+		_, err = gDefaultDB.Exec(query, paramMap)
 	} else {
-		query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", table)
-		_, err = gDefaultDB.Exec(query, id)
+		query := fmt.Sprintf("DELETE FROM %s WHERE id = :id", table)
+		_, err = gDefaultDB.Exec(query, paramMap)
 	}
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "delete"})
 	}
 	return c.JSON(fiber.Map{"success": true})
 }
@@ -617,28 +588,28 @@ func listModelHandler(c *fiber.Ctx) error {
 		table = toName(modelName)
 	}
 	query := fmt.Sprintf("SELECT * FROM %s", table)
-	rows, err := gDefaultDB.Query(query)
+	rows, err := gDefaultDB.Query(query, nil)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "query list"})
 	}
 	defer rows.Close()
-	var results []map[string]interface{}
+	var results []map[string]any
 	cols, err := rows.Columns()
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "get columns list"})
 	}
 	for rows.Next() {
-		columns := make([]interface{}, len(cols))
-		columnPointers := make([]interface{}, len(cols))
+		columns := make([]any, len(cols))
+		columnPointers := make([]any, len(cols))
 		for i := range columns {
 			columnPointers[i] = &columns[i]
 		}
 		if err := rows.Scan(columnPointers...); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "scan row list"})
 		}
-		record := make(map[string]interface{})
+		record := make(map[string]any)
 		for i, colName := range cols {
-			val := columnPointers[i].(*interface{})
+			val := columnPointers[i].(*any)
 			record[colName] = *val
 		}
 		results = append(results, record)
@@ -754,7 +725,7 @@ func main() {
 				}
 				task := make(Task)
 				if len(r.Request.Body) > 0 {
-					bodyMap := map[string]interface{}{}
+					bodyMap := map[string]any{}
 					if err := c.BodyParser(&bodyMap); err != nil {
 						return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
 					}
@@ -769,7 +740,7 @@ func main() {
 				}
 				out, err := dag.Execute(ctx, task)
 				if err != nil {
-					return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+					return c.Status(400).JSON(fiber.Map{"error": err.Error(), "action": "dag execution", "dag": r.Handler})
 				}
 				resp := make(fiber.Map)
 				for _, f := range r.Response.Fields {

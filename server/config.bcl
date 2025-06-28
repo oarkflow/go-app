@@ -32,11 +32,11 @@ route "login" {
   method  = "POST"
   path    = "/login"
   handler = "loginHandler"
-
+  
   request {
     body = ["email", "password"]
   }
-
+  
   response {
     fields = ["token"]
   }
@@ -78,13 +78,13 @@ dag "loginHandler" {
     input  = ["email", "password"]
     output = ["user"]
   }
-
+  
   node "token" {
     type   = "auth_token"
     input  = ["user"]
     output = ["token"]
   }
-
+  
   edge {
     from = "verify"
     to   = "token"
@@ -101,42 +101,45 @@ dag "logoutHandler" {
 dag "profileHandler" {
   node "fetch" {
     type     = "db_query"
-    query    = "SELECT id, name, email FROM users WHERE id = ?"
+    query    = "SELECT id, name, email FROM users WHERE id = :id"
     input    = ["ctx_userid"]
+    field_mapping = {
+	  id    = "ctx_userid"
+	}
     output   = ["user"]
     provider = "master-sqlite"
   }
 }
 
 model "user" {
-	table    = "users"
-	rest     = true
-	prefix   = "users"
-	provider = "master-sqlite"
-	fields = [
-	  { name = "id", data_type = "TEXT" },
-	  { name = "name", data_type = "TEXT" },
-	  { name = "email", data_type = "TEXT" },
-	  { name = "password", data_type = "TEXT" }
-	]
+  table    = "users"
+  rest     = true
+  prefix   = "users"
+  provider = "master-sqlite"
+  fields = [
+    { name = "id", data_type = "TEXT" },
+    { name = "name", data_type = "TEXT" },
+    { name = "email", data_type = "TEXT" },
+    { name = "password", data_type = "TEXT" }
+  ]
 }
 
-auth = {
-  login = {
+auth {
+  login {
     route            = "login"
     user_model       = "user"
     username_field   = "email"
     credential_model = "user"
     password_field   = "password"
   }
-  logout = {
-	route = "logout"
+  logout {
+    route = "logout"
   }
 }
 
 auth_guard "jwt" {
-	name        = "jwt"
-	placeholder = "header"
-	key         = "Authorization"
-	scheme      = "Bearer"
+  name        = "jwt"
+  placeholder = "header"
+  key         = "Authorization"
+  scheme      = "Bearer"
 }
