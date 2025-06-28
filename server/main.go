@@ -21,9 +21,47 @@ import (
 )
 
 var (
-	gDefaultDB *squealx.DB
-	modelsMap  map[string]ModelConfig
+	gDefaultDB   *squealx.DB
+	modelsMap    map[string]ModelConfig
+	authCfg      AuthConfig
+	providersMap map[string]*squealx.DB
 )
+
+type AuthLoginConfig struct {
+	Route           string `bcl:"route"`
+	UserModel       string `bcl:"user_model"`
+	UsernameField   string `bcl:"username_field"`
+	CredentialModel string `bcl:"credential_model"`
+	PasswordField   string `bcl:"password_field"`
+}
+type AuthLogoutConfig struct {
+	Route string `bcl:"route"`
+}
+type AuthConfig struct {
+	Login  AuthLoginConfig  `bcl:"login"`
+	Logout AuthLogoutConfig `bcl:"logout"`
+}
+
+type Config struct {
+	Server           ServerConfig       `bcl:"server"`
+	Provider         []ProviderConfig   `bcl:"provider"`
+	Middleware       []MiddlewareConfig `bcl:"middleware"`
+	GlobalMiddleware []string           `bcl:"global_middleware"`
+	Group            []GroupConfig      `bcl:"group"`
+	Route            []RouteConfig      `bcl:"route"`
+	DAG              []DAGConfig        `bcl:"dag"`
+	Models           []ModelConfig      `bcl:"model"`
+	Auth             AuthConfig         `bcl:"auth"`
+}
+
+type ModelConfig struct {
+	Name     string       `bcl:"name"`
+	Table    string       `bcl:"table"`
+	Rest     bool         `bcl:"rest"`
+	Prefix   string       `bcl:"prefix,optional"`
+	Provider string       `bcl:"provider,optional"`
+	Fields   []ModelField `bcl:"fields"`
+}
 
 type ProviderConfig struct {
 	Name    string `bcl:"name"`
@@ -96,52 +134,6 @@ type ModelField struct {
 	DataType   string `bcl:"data_type"`
 	DefaultVal string `bcl:"default_val"`
 	SoftDelete bool   `bcl:"soft_delete"`
-}
-
-type ModelConfig struct {
-	Name   string       `bcl:"name"`
-	Table  string       `bcl:"table"`
-	Rest   bool         `bcl:"rest"`
-	Prefix string       `bcl:"prefix,optional"`
-	Fields []ModelField `bcl:"fields"`
-}
-
-type Config struct {
-	Server           ServerConfig       `bcl:"server"`
-	Provider         []ProviderConfig   `bcl:"provider"`
-	Middleware       []MiddlewareConfig `bcl:"middleware"`
-	GlobalMiddleware []string           `bcl:"global_middleware"`
-	Group            []GroupConfig      `bcl:"group"`
-	Route            []RouteConfig      `bcl:"route"`
-	DAG              []DAGConfig        `bcl:"dag"`
-	Models           []ModelConfig      `bcl:"model"`
-}
-
-func InitDB(name, driver, dsn string) (*squealx.DB, error) {
-	db, err := squealx.Open(driver, dsn, name)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.Ping(); err != nil {
-		return nil, err
-	}
-	schema := `
-    PRAGMA foreign_keys=ON;
-    CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE, password TEXT);
-    CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, userid TEXT, FOREIGN KEY(userid) REFERENCES users(id));
-    INSERT OR IGNORE INTO users(id,name,email,password) VALUES (
-      '1','Alice','alice@example.com','` + hashPassword("alicepass") + `'
-    );
-    `
-	if _, err := db.Exec(schema); err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-func hashPassword(pw string) string {
-	b, _ := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
-	return string(b)
 }
 
 type Task = map[string]interface{}
@@ -277,23 +269,39 @@ func nQueryParams(in Task, query string) []string {
 }
 
 type AuthVerifyNode struct {
-	DB *squealx.DB
+	DB              *squealx.DB
+	UsernameField   string
+	PasswordField   string
+	UserTable       string
+	CredentialTable string
 }
 
 func (n *AuthVerifyNode) Process(_ context.Context, in Task) (Result, error) {
-	email := in["email"].(string)
-	pass := in["password"].(string)
-	var user struct {
-		ID       string `db:"id"`
-		Password string `db:"password"`
+
+	username, ok := in[authCfg.Login.UsernameField].(string)
+	if !ok {
+		return nil, fmt.Errorf("username field %s missing or invalid", authCfg.Login.UsernameField)
 	}
-	if err := n.DB.Get(&user, "SELECT id,password FROM users WHERE email=?", email); err != nil {
-		return nil, err
+	userQuery := fmt.Sprintf("SELECT id FROM %s WHERE %s = ?", n.UserTable, n.UsernameField)
+	var userID string
+	if err := n.DB.QueryRow(userQuery, username).Scan(&userID); err != nil {
+		return nil, fmt.Errorf("user not found or error: %v", err)
 	}
-	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(pass)) != nil {
+
+	credQuery := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", n.PasswordField, n.CredentialTable)
+	var storedPass string
+	if err := n.DB.QueryRow(credQuery, userID).Scan(&storedPass); err != nil {
+		return nil, fmt.Errorf("credentials not found or error: %v", err)
+	}
+
+	pass, ok := in[authCfg.Login.PasswordField].(string)
+	if !ok {
+		return nil, fmt.Errorf("password field %s missing", authCfg.Login.PasswordField)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(storedPass), []byte(pass)); err != nil {
 		return nil, errors.New("invalid credentials")
 	}
-	return Result{"user": user.ID}, nil
+	return Result{"user": userID}, nil
 }
 
 type AuthTokenNode struct {
@@ -375,7 +383,30 @@ func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squea
 					QueryFieldMapping:  nd.QueryFieldMapping,
 				}
 			case "auth_verify":
-				proc = &AuthVerifyNode{DB: dbConn}
+
+				userModel, ok := modelsMap[authCfg.Login.UserModel]
+				if !ok {
+					log.Fatalf("user model %s not found", authCfg.Login.UserModel)
+				}
+				credModel, ok := modelsMap[authCfg.Login.CredentialModel]
+				if !ok {
+					log.Fatalf("credential model %s not found", authCfg.Login.CredentialModel)
+				}
+				userTable := userModel.Table
+				if userTable == "" {
+					userTable = toName(authCfg.Login.UserModel)
+				}
+				credTable := credModel.Table
+				if credTable == "" {
+					credTable = toName(authCfg.Login.CredentialModel)
+				}
+				proc = &AuthVerifyNode{
+					DB:              dbConn,
+					UsernameField:   authCfg.Login.UsernameField,
+					PasswordField:   authCfg.Login.PasswordField,
+					UserTable:       userTable,
+					CredentialTable: credTable,
+				}
 			case "auth_token":
 				proc = &AuthTokenNode{DB: dbConn, JWTSecret: []byte(secret), TTLSeconds: 3600}
 			case "auth_revoke":
@@ -409,6 +440,7 @@ func findSecret(cfg *Config) string {
 }
 
 func createModelHandler(c *fiber.Ctx) error {
+
 	modelName := c.Params("model")
 	if modelName == "" {
 		if val := c.Locals("model"); val != nil {
@@ -441,7 +473,8 @@ func createModelHandler(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "no valid fields provided"})
 	}
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	res, err := gDefaultDB.Exec(query, values...)
+	db := getModelDB(m)
+	res, err := db.Exec(query, values...)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -613,6 +646,26 @@ func listModelHandler(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"records": results})
 }
 
+func InitDB(name, driver, dsn string) (*squealx.DB, error) {
+	db, err := squealx.Open(driver, dsn, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+func getModelDB(m ModelConfig) *squealx.DB {
+	if m.Provider != "" {
+		if db, ok := providersMap[m.Provider]; ok {
+			return db
+		}
+	}
+	return gDefaultDB
+}
+
 func main() {
 	bt, err := os.ReadFile("config.bcl")
 	if err != nil {
@@ -642,6 +695,7 @@ func main() {
 	for _, m := range cfg.Models {
 		modelsMap[m.Name] = m
 	}
+	authCfg = cfg.Auth
 	app := fiber.New(fiber.Config{EnablePrintRoutes: true})
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {

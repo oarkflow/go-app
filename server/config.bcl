@@ -17,6 +17,7 @@ middleware "log" {
 
 middleware "jwt" {
   type   = "jwt"
+  guard  = "jwt"
   secret = "supersecret"
 }
 
@@ -62,10 +63,10 @@ route "profile" {
 }
 
 route "adminProfile" {
-  group      = "admin"
-  method     = "GET"
-  path       = "/profile"
-  handler    = "profileHandler"
+  group   = "admin"
+  method  = "GET"
+  path    = "/profile"
+  handler = "profileHandler"
   response {
     fields = ["user"]
   }
@@ -108,13 +109,34 @@ dag "profileHandler" {
 }
 
 model "user" {
-	table = "users"
-	rest  = true
-    prefix = "users"
+	table    = "users"
+	rest     = true
+	prefix   = "users"
+	provider = "master-sqlite"
 	fields = [
 	  { name = "id", data_type = "TEXT" },
 	  { name = "name", data_type = "TEXT" },
 	  { name = "email", data_type = "TEXT" },
 	  { name = "password", data_type = "TEXT" }
 	]
+}
+
+auth = {
+  login = {
+    route            = "login"
+    user_model       = "user"
+    username_field   = "email"
+    credential_model = "user"
+    password_field   = "password"
+  }
+  logout = {
+	route = "logout"
+  }
+}
+
+auth_guard "jwt" {
+	name        = "jwt"
+	placeholder = "header"
+	key         = "Authorization"
+	scheme      = "Bearer"
 }
