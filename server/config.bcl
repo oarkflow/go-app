@@ -21,7 +21,22 @@ middleware "jwt" {
   secret = "supersecret"
 }
 
-global_middleware = ["log"]
+middleware "cors" {
+  type          = "cors"
+  allow_origins = "*" // allow all origins
+}
+
+middleware "ratelimit" {
+  type   = "ratelimit"
+  max    = 100
+  window = 60
+}
+
+middleware "compress" {
+  type = "compress"
+}
+
+global_middleware = ["log", "cors", "ratelimit", "compress"]
 
 group "admin" {
   path       = "/admin"

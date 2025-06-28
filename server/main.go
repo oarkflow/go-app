@@ -8,16 +8,18 @@ import (
 
 	jwtware "github.com/gofiber/contrib/jwt"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/oarkflow/bcl"
+	"github.com/oarkflow/squealx"
+	_ "modernc.org/sqlite"
 
 	"github.com/oarkflow/dag/server/handlers"
 	"github.com/oarkflow/dag/server/pkg/config"
 	"github.com/oarkflow/dag/server/pkg/dag"
-
-	"github.com/oarkflow/squealx"
-	_ "modernc.org/sqlite"
 )
 
 func WithJWT(secret []byte) fiber.Handler {
@@ -85,6 +87,12 @@ func main() {
 			globalMW[m.Name] = logger.New()
 		case "jwt":
 			globalMW[m.Name] = WithJWT([]byte(m.Secret))
+		case "cors":
+			globalMW[m.Name] = cors.New()
+		case "ratelimit":
+			globalMW[m.Name] = limiter.New()
+		case "compress":
+			globalMW[m.Name] = compress.New()
 		default:
 			log.Fatalf("unsupported middleware: %s", m.Type)
 		}
@@ -115,15 +123,15 @@ func main() {
 		}
 		var h fiber.Handler
 		switch r.Handler {
-		case "crud_create":
+		case "create":
 			h = handlers.Create
-		case "crud_read":
+		case "read":
 			h = handlers.Read
-		case "crud_update":
+		case "update":
 			h = handlers.Update
-		case "crud_delete":
+		case "delete":
 			h = handlers.Delete
-		case "crud_list":
+		case "list":
 			h = handlers.List
 		default:
 			dagInstance := dags[r.Handler]

@@ -75,7 +75,9 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 			if !ready {
 				continue
 			}
+			start := time.Now()
 			res, err := node.Processor.Process(ctx, data)
+			log.Printf("Node %s executed in %v", name, time.Since(start))
 			if err != nil {
 				return nil, err
 			}

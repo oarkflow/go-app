@@ -17,6 +17,9 @@ var (
 	ModelsMap    map[string]config.Model
 	AuthCfg      config.Auth
 	ProvidersMap map[string]*squealx.DB
+	BeforeHook   func(c *fiber.Ctx, action string) error
+	AfterHook    func(c *fiber.Ctx, action string, result any) error
+	Validator    func(c *fiber.Ctx, modelName string, action string, data map[string]any) error
 )
 
 func Create(c *fiber.Ctx) error {
@@ -164,35 +167,61 @@ func List(c *fiber.Ctx) error {
 	if table == "" {
 		table = toName(modelName)
 	}
-	query := fmt.Sprintf("SELECT * FROM %s", table)
-	db := getModelDB(m) // use getModelDB instead of DefaultDB.
-	rows, err := db.Query(query, nil)
+	// Pagination, filtering, sorting
+	page := c.Locals("page")
+	limit := c.Locals("limit")
+	sort := c.Locals("sort")
+	order := c.Locals("order")
+	filter := c.Locals("filter")
+	pageInt, _ := page.(int)
+	limitInt, _ := limit.(int)
+	if pageInt < 1 {
+		pageInt = 1
+	}
+	if limitInt < 1 {
+		limitInt = 20
+	}
+	offset := (pageInt - 1) * limitInt
+	where := ""
+	args := map[string]any{}
+	if filterStr, ok := filter.(string); ok && filterStr != "" {
+		// Simple filter: search all text fields
+		conds := []string{}
+		for _, field := range m.Fields {
+			if field.DataType == "TEXT" {
+				conds = append(conds, field.Name+" LIKE :filter")
+			}
+		}
+		if len(conds) > 0 {
+			where = "WHERE " + strings.Join(conds, " OR ")
+			args["filter"] = "%" + filterStr + "%"
+		}
+	}
+	orderBy := "id"
+	if sortStr, ok := sort.(string); ok && sortStr != "" {
+		orderBy = sortStr
+	}
+	orderDir := "ASC"
+	if orderStr, ok := order.(string); ok && (orderStr == "asc" || orderStr == "desc") {
+		orderDir = strings.ToUpper(orderStr)
+	}
+	query := fmt.Sprintf("SELECT * FROM %s %s ORDER BY %s %s LIMIT :limit OFFSET :offset", table, where, orderBy, orderDir)
+	args["limit"] = limitInt
+	args["offset"] = offset
+	db := getModelDB(m)
+	var results []map[string]any
+	err := db.Select(&results, query, args)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "query list"})
 	}
-	defer rows.Close()
-	var results []map[string]any
-	cols, err := rows.Columns()
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "get columns list"})
+	// Add response metadata
+	meta := fiber.Map{
+		"page":    pageInt,
+		"limit":   limitInt,
+		"count":   len(results),
+		"traceId": c.Locals("requestid"),
 	}
-	for rows.Next() {
-		columns := make([]any, len(cols))
-		columnPointers := make([]any, len(cols))
-		for i := range columns {
-			columnPointers[i] = &columns[i]
-		}
-		if err := rows.Scan(columnPointers...); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error(), "action": "scan row list"})
-		}
-		record := make(map[string]any)
-		for i, colName := range cols {
-			val := columnPointers[i].(*any)
-			record[colName] = *val
-		}
-		results = append(results, record)
-	}
-	return c.JSON(fiber.Map{"records": results})
+	return c.JSON(fiber.Map{"records": results, "meta": meta})
 }
 
 func singularToPlural(word string) string {
