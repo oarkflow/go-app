@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -23,10 +22,8 @@ import (
 
 var (
 	gDefaultDB *squealx.DB
-	modelsMap  map[string]ModelConfig // Global map of models for CRUD operations
+	modelsMap  map[string]ModelConfig
 )
-
-/* --- CONFIG STRUCTS --- */
 
 type ProviderConfig struct {
 	Name    string `bcl:"name"`
@@ -76,7 +73,6 @@ type DAGConfig struct {
 	Edge []EdgeRaw       `bcl:"edge"`
 }
 
-// Updated NodeConfigRaw with mapping fields.
 type NodeConfigRaw struct {
 	Name               string            `bcl:"name"`
 	Type               string            `bcl:"type"`
@@ -95,7 +91,6 @@ type EdgeRaw struct {
 	To   string `bcl:"to"`
 }
 
-// NEW: Model types for defining table/source in provider.
 type ModelField struct {
 	Name       string `bcl:"name"`
 	DataType   string `bcl:"data_type"`
@@ -107,7 +102,7 @@ type ModelConfig struct {
 	Name   string       `bcl:"name"`
 	Table  string       `bcl:"table"`
 	Rest   bool         `bcl:"rest"`
-	Prefix string       `bcl:"prefix,optional"` // new optional prefix for route
+	Prefix string       `bcl:"prefix,optional"`
 	Fields []ModelField `bcl:"fields"`
 }
 
@@ -122,9 +117,6 @@ type Config struct {
 	Models           []ModelConfig      `bcl:"model"`
 }
 
-/* --- DB INIT --- */
-
-// Refactored InitDB to accept a driver parameter from config.bcl.
 func InitDB(name, driver, dsn string) (*squealx.DB, error) {
 	db, err := squealx.Open(driver, dsn, name)
 	if err != nil {
@@ -151,8 +143,6 @@ func hashPassword(pw string) string {
 	b, _ := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 	return string(b)
 }
-
-/* --- DAG ENGINE --- */
 
 type Task = map[string]interface{}
 type Result = map[string]interface{}
@@ -193,14 +183,12 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 		data[k] = v
 	}
 	executed := make(map[string]bool)
-
 	for len(executed) < len(d.Nodes) {
 		progress := false
 		for name, node := range d.Nodes {
 			if executed[name] {
 				continue
 			}
-			// Ensure required input from context if missing from task
 			for _, inKey := range node.Input {
 				if _, ok := data[inKey]; !ok {
 					if v := ctx.Value(inKey); v != nil {
@@ -237,8 +225,6 @@ func (d *DAG) Execute(ctx context.Context, input Task) (Task, error) {
 	return data, nil
 }
 
-/* --- NODE TYPES --- */
-
 type DBQueryNode struct {
 	Query              string
 	DB                 *squealx.DB
@@ -254,7 +240,6 @@ func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
 	for _, k := range nQueryParams(in, n.Query) {
 		params = append(params, in[k])
 	}
-	// use sqlx Get to retrieve into a struct
 	var user struct {
 		ID    string `db:"id"`
 		Name  string `db:"name"`
@@ -263,9 +248,7 @@ func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
 	if err := n.DB.Get(&user, n.Query, params...); err != nil {
 		return nil, err
 	}
-	// initial result from DB
 	result := Result{n.OutKey: map[string]string{"id": user.ID, "name": user.Name, "email": user.Email}}
-	// Apply query field mapping if provided.
 	if n.QueryFieldMapping != nil && len(n.QueryFieldMapping) > 0 {
 		orig := result[n.OutKey].(map[string]string)
 		mapped := make(map[string]string)
@@ -282,7 +265,6 @@ func (n *DBQueryNode) Process(_ context.Context, in Task) (Result, error) {
 }
 
 func nQueryParams(in Task, query string) []string {
-	// naive counting of "?" to match param order fallback
 	count := strings.Count(query, "?")
 	var keys []string
 	for k := range in {
@@ -348,8 +330,6 @@ func (n *AuthRevokeNode) Process(ctx context.Context, _ Task) (Result, error) {
 	return Result{"success": true}, nil
 }
 
-/* --- MIDDLEWARE HELPERS --- */
-
 func WithJWT(secret []byte) fiber.Handler {
 	return jwtware.New(jwtware.Config{
 		SigningKey: jwtware.SigningKey{Key: secret},
@@ -365,8 +345,6 @@ func WithJWT(secret []byte) fiber.Handler {
 		},
 	})
 }
-
-/* --- BUILD DAGs FROM CONFIG --- */
 
 func buildDAGs(cfg *Config, dbProviders map[string]*squealx.DB, defaultDB *squealx.DB) map[string]*DAG {
 	dags := make(map[string]*DAG)
@@ -430,8 +408,6 @@ func findSecret(cfg *Config) string {
 	return ""
 }
 
-/* --- UPDATED: CRUD HANDLERS --- */
-
 func createModelHandler(c *fiber.Ctx) error {
 	modelName := c.Params("model")
 	if modelName == "" {
@@ -449,11 +425,11 @@ func createModelHandler(c *fiber.Ctx) error {
 	}
 	table := m.Table
 	if table == "" {
-		table = modelName
+		table = toName(modelName)
 	}
-	cols := []string{}
-	placeholders := []string{}
-	values := []interface{}{}
+	var cols []string
+	var placeholders []string
+	var values []interface{}
 	for _, field := range m.Fields {
 		if v, exists := payload[field.Name]; exists {
 			cols = append(cols, field.Name)
@@ -487,22 +463,22 @@ func readModelHandler(c *fiber.Ctx) error {
 	}
 	table := m.Table
 	if table == "" {
-		table = modelName
+		table = toName(modelName)
 	}
 	query := fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table)
 	row := gDefaultDB.QueryRow(query, id)
 	result := make(map[string]interface{})
-	cols := []string{}
+	var cols []string
 	for _, f := range m.Fields {
 		cols = append(cols, f.Name)
 		result[f.Name] = new(interface{})
 	}
-	args := []interface{}{}
+	var args []interface{}
 	for _, f := range m.Fields {
 		args = append(args, result[f.Name])
 	}
 	if err := row.Scan(args...); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return c.Status(404).JSON(fiber.Map{"error": "record not found"})
 		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
@@ -527,14 +503,14 @@ func updateModelHandler(c *fiber.Ctx) error {
 	}
 	table := m.Table
 	if table == "" {
-		table = modelName
+		table = toName(modelName)
 	}
 	var payload map[string]interface{}
 	if err := c.BodyParser(&payload); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
 	}
-	sets := []string{}
-	values := []interface{}{}
+	var sets []string
+	var values []interface{}
 	for _, field := range m.Fields {
 		if v, exists := payload[field.Name]; exists {
 			sets = append(sets, fmt.Sprintf("%s = ?", field.Name))
@@ -567,7 +543,7 @@ func deleteModelHandler(c *fiber.Ctx) error {
 	}
 	table := m.Table
 	if table == "" {
-		table = modelName
+		table = toName(modelName)
 	}
 	softDelete := false
 	var softField string
@@ -592,7 +568,6 @@ func deleteModelHandler(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"success": true})
 }
 
-// NEW: Handler to list all rows for a model.
 func listModelHandler(c *fiber.Ctx) error {
 	modelName := c.Params("model")
 	if modelName == "" {
@@ -606,23 +581,19 @@ func listModelHandler(c *fiber.Ctx) error {
 	}
 	table := m.Table
 	if table == "" {
-		table = modelName
+		table = toName(modelName)
 	}
-	// Build query to fetch all fields.
 	query := fmt.Sprintf("SELECT * FROM %s", table)
 	rows, err := gDefaultDB.Query(query)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 	defer rows.Close()
-
-	// Create a slice of maps.
 	var results []map[string]interface{}
 	cols, err := rows.Columns()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
-
 	for rows.Next() {
 		columns := make([]interface{}, len(cols))
 		columnPointers := make([]interface{}, len(cols))
@@ -642,8 +613,6 @@ func listModelHandler(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"records": results})
 }
 
-/* --- MAIN --- */
-
 func main() {
 	bt, err := os.ReadFile("config.bcl")
 	if err != nil {
@@ -653,8 +622,6 @@ func main() {
 	if _, err := bcl.Unmarshal(bt, &cfg); err != nil {
 		log.Fatal("bcl parse:", err)
 	}
-
-	// Initialize DB connections for providers using driver from config.
 	dbProviders := make(map[string]*squealx.DB)
 	var defaultDB *squealx.DB
 	for _, p := range cfg.Provider {
@@ -670,16 +637,12 @@ func main() {
 	if defaultDB == nil {
 		log.Fatal("no default database provider found in config")
 	}
-	// Set global default DB and build models map.
 	gDefaultDB = defaultDB
 	modelsMap = make(map[string]ModelConfig)
 	for _, m := range cfg.Models {
 		modelsMap[m.Name] = m
 	}
-
 	app := fiber.New(fiber.Config{EnablePrintRoutes: true})
-
-	// Build mapping for all middleware.
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
 		switch m.Type {
@@ -691,8 +654,6 @@ func main() {
 			log.Fatalf("unsupported middleware: %s", m.Type)
 		}
 	}
-
-	// Register global middleware as specified in GlobalMiddleware.
 	for _, mwName := range cfg.GlobalMiddleware {
 		if mw, ok := globalMW[mwName]; ok {
 			app.Use(mw)
@@ -700,10 +661,7 @@ func main() {
 			log.Fatalf("global middleware %s not found", mwName)
 		}
 	}
-
 	dags := buildDAGs(&cfg, dbProviders, defaultDB)
-
-	// Modified route registration to support CRUD operations.
 	for _, r := range cfg.Route {
 		fullPath := r.Path
 		if r.Group != "" {
@@ -721,7 +679,6 @@ func main() {
 			r.Middleware = append(grp.Middleware, r.Middleware...)
 		}
 		var h fiber.Handler
-		// Use CRUD handlers if the route handler indicates a CRUD operation.
 		switch r.Handler {
 		case "crud_create":
 			h = createModelHandler
@@ -732,7 +689,6 @@ func main() {
 		case "crud_delete":
 			h = deleteModelHandler
 		default:
-			// Use DAG-based handler.
 			dag := dags[r.Handler]
 			h = func(c *fiber.Ctx) error {
 				ctx := context.Background()
@@ -778,15 +734,12 @@ func main() {
 		app.Add(strings.ToUpper(r.Method), fullPath, stack...)
 	}
 
-	// NEW: Automatically register CRUD routes for models with Rest=true.
 	for _, m := range cfg.Models {
 		if m.Rest {
-			// Use model prefix if provided; otherwise, use pluralized model name.
 			routePrefix := m.Prefix
 			if routePrefix == "" {
-				routePrefix = singularToPlural(m.Name)
+				routePrefix = toSlug(m.Name)
 			}
-			// Register CRUD routes without "/crud" prefix.
 			app.Post("/"+routePrefix, func(c *fiber.Ctx) error {
 				c.Locals("model", m.Name)
 				return createModelHandler(c)
@@ -809,28 +762,23 @@ func main() {
 			})
 		}
 	}
-
 	log.Printf("Listening on %s...", cfg.Server.Address)
 	log.Fatal(app.Listen(cfg.Server.Address))
 }
 
-// NEW: Helper function to convert a singular word to its naive plural form.
 func singularToPlural(word string) string {
 	if len(word) == 0 {
 		return word
 	}
-	// if already ends with "s", assume plural.
 	if strings.HasSuffix(word, "s") {
 		return word
 	}
-	// if word ends with "y", convert "y" to "ies"
 	if strings.HasSuffix(word, "y") {
 		return word[:len(word)-1] + "ies"
 	}
 	return word + "s"
 }
 
-// NEW: Helper function to convert a plural word to its naive singular form.
 func pluralToSingular(word string) string {
 	if len(word) == 0 {
 		return word
@@ -842,4 +790,14 @@ func pluralToSingular(word string) string {
 		return word[:len(word)-1]
 	}
 	return word
+}
+
+func toSlug(word string) string {
+	slug := strings.ReplaceAll(strings.ToLower(word), "_", "-")
+	return singularToPlural(slug)
+}
+
+func toName(word string) string {
+	name := strings.ReplaceAll(strings.ToLower(word), "-", "_")
+	return singularToPlural(name)
 }

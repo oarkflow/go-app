@@ -24,7 +24,7 @@ global_middleware = ["log"]
 
 group "admin" {
   path       = "/admin"
-  middleware = ["log"]
+  middleware = ["log", "jwt"]
 }
 
 route "login" {
@@ -66,7 +66,6 @@ route "adminProfile" {
   method     = "GET"
   path       = "/profile"
   handler    = "profileHandler"
-  middleware = ["jwt"]
   response {
     fields = ["user"]
   }
@@ -111,7 +110,7 @@ dag "profileHandler" {
 model "user" {
 	table = "users"
 	rest  = true
-    prefix = "users"  // optional prefix for CRUD routes; if omitted, system will pluralize "user" to "users"
+    prefix = "users"
 	fields = [
 	  { name = "id", data_type = "TEXT" },
 	  { name = "name", data_type = "TEXT" },
