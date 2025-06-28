@@ -7,6 +7,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/grandcat/zeroconf v1.0.0
+	github.com/joho/godotenv v1.5.1
 	github.com/kaptinlin/jsonschema v0.3.0
 	github.com/libp2p/go-libp2p v0.41.1
 	github.com/libp2p/go-libp2p-kad-dht v0.33.1
@@ -15,6 +16,7 @@ require (
 	github.com/oarkflow/bcl v0.0.10
 	github.com/oarkflow/json v0.0.28
 	github.com/oarkflow/squealx v0.0.54
+	github.com/oarkflow/supervisor v0.0.0-20250616090112-d69979fa94bb
 	github.com/pion/webrtc/v3 v3.3.5
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/time v0.11.0
@@ -28,6 +30,7 @@ require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/filecoin-project/go-clock v0.1.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
@@ -48,6 +51,7 @@ require (
 	github.com/libp2p/go-yamux/v5 v5.0.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
+	github.com/natefinch/lumberjack v2.0.0+incompatible // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/oarkflow/date v0.0.4 // indirect
 	github.com/oarkflow/expr v0.0.11 // indirect

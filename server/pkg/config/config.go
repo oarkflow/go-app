@@ -44,10 +44,17 @@ type Provider struct {
 	Default bool   `bcl:"default"`
 }
 
+type HealthCheck struct {
+	Enabled bool   `bcl:"enabled"`
+	Path    string `bcl:"path"`
+}
+
 type Server struct {
-	Address      string `bcl:"address"`
-	ReadTimeout  int    `bcl:"read_timeout"`
-	WriteTimeout int    `bcl:"write_timeout"`
+	Name         string      `bcl:"name"`
+	Address      string      `bcl:"address"`
+	ReadTimeout  int         `bcl:"read_timeout"`
+	WriteTimeout int         `bcl:"write_timeout"`
+	HealthCheck  HealthCheck `bcl:"health_check"`
 }
 
 type Middleware struct {
@@ -62,6 +69,15 @@ type Group struct {
 	Middleware []string `bcl:"middleware"`
 }
 
+type Request struct {
+	Body   []string `bcl:"body"`
+	Params []string `bcl:"params"`
+}
+
+type Response struct {
+	Fields []string `bcl:"fields"`
+}
+
 type Route struct {
 	Name       string   `bcl:"name"`
 	Group      string   `bcl:"group"`
@@ -69,13 +85,8 @@ type Route struct {
 	Path       string   `bcl:"path"`
 	Middleware []string `bcl:"middleware"`
 	Handler    string   `bcl:"handler"`
-	Request    struct {
-		Body   []string `bcl:"body"`
-		Params []string `bcl:"params"`
-	} `bcl:"request"`
-	Response struct {
-		Fields []string `bcl:"fields"`
-	} `bcl:"response"`
+	Request    Request  `bcl:"request"`
+	Response   Response `bcl:"response"`
 }
 
 type DAG struct {

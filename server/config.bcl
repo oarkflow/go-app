@@ -1,7 +1,11 @@
-server {
-  address      = "0.0.0.0:8080"
+server "Server App" {
+  address      = "${env.APP_HOST}"
   read_timeout = 10
   write_timeout= 10
+  health_check {
+    enabled = true
+	path = "/health"
+  }
 }
 
 provider "master-sqlite" {

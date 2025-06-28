@@ -3,3 +3,4 @@ go-app.iml
 .history
 supervisor/log
 *.db
+*.log

@@ -17,9 +17,12 @@ import (
 	"github.com/oarkflow/squealx"
 	_ "modernc.org/sqlite"
 
-	"github.com/oarkflow/dag/server/handlers"
 	"github.com/oarkflow/dag/server/pkg/config"
 	"github.com/oarkflow/dag/server/pkg/dag"
+	"github.com/oarkflow/dag/server/pkg/handlers"
+
+	"github.com/joho/godotenv"
+	"github.com/oarkflow/supervisor"
 )
 
 func WithJWT(secret []byte) fiber.Handler {
@@ -50,6 +53,14 @@ func InitDB(name, driver, dsn string) (*squealx.DB, error) {
 }
 
 func main() {
+	supervisor.Run("config.json", Run)
+}
+
+func Run(ctx context.Context) error {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("error on read .env:", err)
+	}
 	bt, err := os.ReadFile("config.bcl")
 	if err != nil {
 		log.Fatal("read config:", err)
@@ -79,7 +90,16 @@ func main() {
 		handlers.ModelsMap[m.Name] = m
 	}
 	handlers.AuthCfg = cfg.Auth
-	app := fiber.New(fiber.Config{EnablePrintRoutes: true})
+	app := fiber.New(fiber.Config{AppName: cfg.Server.Name})
+	if cfg.Server.HealthCheck.Enabled {
+		path := cfg.Server.HealthCheck.Path
+		if path == "" {
+			path = "/health"
+		}
+		app.Get(path, func(c *fiber.Ctx) error {
+			return c.Status(200).JSON(fiber.Map{"status": "ok"})
+		})
+	}
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
 		switch m.Type {
@@ -207,6 +227,14 @@ func main() {
 			})
 		}
 	}
-	log.Printf("Listening on %s...", cfg.Server.Address)
-	log.Fatal(app.Listen(cfg.Server.Address))
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("Listening on %s...", cfg.Server.Address)
+		errCh <- app.Listen(cfg.Server.Address)
+	}()
+
+	<-ctx.Done()
+	log.Println("Draining server connections and shutting down")
+	_ = app.Shutdown()
+	return <-errCh
 }
