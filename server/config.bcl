@@ -1,24 +1,26 @@
 server {
-  address = "0.0.0.0:8080"
+  address      = "0.0.0.0:8080"
+  read_timeout = 10
+  write_timeout= 10
 }
 
 provider "master-sqlite" {
   driver  = "sqlite"
-  type = "database"
+  type    = "database"
   dsn     = "file:app.db?cache=shared&mode=rwc"
   default = true
 }
 
 middleware "log" {
-  type   = "logger"
-  global = true
+  type = "logger"
 }
 
 middleware "jwt" {
   type   = "jwt"
   secret = "supersecret"
-  global = false
 }
+
+global_middleware = ["log", "jwt"]
 
 group "admin" {
   path       = "/admin"
@@ -60,10 +62,10 @@ route "profile" {
 }
 
 route "adminProfile" {
-  group     = "admin"
-  method    = "GET"
-  path      = "/profile"
-  handler   = "profileHandler"
+  group      = "admin"
+  method     = "GET"
+  path       = "/profile"
+  handler    = "profileHandler"
   middleware = ["jwt"]
   response {
     fields = ["user"]

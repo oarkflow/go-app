@@ -29,24 +29,16 @@ type ProviderConfig struct {
 	Default bool   `bcl:"default"`
 }
 
-type Config struct {
-	Server     ServerConfig       `bcl:"server"`
-	Provider   []ProviderConfig   `bcl:"provider"`
-	Middleware []MiddlewareConfig `bcl:"middleware"`
-	Group      []GroupConfig      `bcl:"group"`
-	Route      []RouteConfig      `bcl:"route"`
-	DAG        []DAGConfig        `bcl:"dag"`
-}
-
 type ServerConfig struct {
-	Address string `bcl:"address"`
+	Address      string `bcl:"address"`
+	ReadTimeout  int    `bcl:"read_timeout"`
+	WriteTimeout int    `bcl:"write_timeout"`
 }
 
 type MiddlewareConfig struct {
 	Name   string `bcl:"name"`
 	Type   string `bcl:"type"`
 	Secret string `bcl:"secret"`
-	Global bool   `bcl:"global"`
 }
 
 type GroupConfig struct {
@@ -89,6 +81,16 @@ type NodeConfigRaw struct {
 type EdgeRaw struct {
 	From string `bcl:"from"`
 	To   string `bcl:"to"`
+}
+
+type Config struct {
+	Server           ServerConfig       `bcl:"server"`
+	Provider         []ProviderConfig   `bcl:"provider"`
+	Middleware       []MiddlewareConfig `bcl:"middleware"`
+	GlobalMiddleware []string           `bcl:"global_middleware"`
+	Group            []GroupConfig      `bcl:"group"`
+	Route            []RouteConfig      `bcl:"route"`
+	DAG              []DAGConfig        `bcl:"dag"`
 }
 
 /* --- DB INIT --- */
@@ -403,23 +405,26 @@ func main() {
 	}
 
 	app := fiber.New()
+
+	// Build mapping for all middleware.
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
 		switch m.Type {
 		case "logger":
-			if m.Global {
-				app.Use(logger.New())
-			} else {
-				globalMW[m.Name] = logger.New()
-			}
+			globalMW[m.Name] = logger.New()
 		case "jwt":
-			if m.Global {
-				app.Use(WithJWT([]byte(m.Secret)))
-			} else {
-				globalMW[m.Name] = WithJWT([]byte(m.Secret))
-			}
+			globalMW[m.Name] = WithJWT([]byte(m.Secret))
 		default:
 			log.Fatalf("unsupported middleware: %s", m.Type)
+		}
+	}
+
+	// Register global middleware as specified in GlobalMiddleware.
+	for _, mwName := range cfg.GlobalMiddleware {
+		if mw, ok := globalMW[mwName]; ok {
+			app.Use(mw)
+		} else {
+			log.Fatalf("global middleware %s not found", mwName)
 		}
 	}
 
