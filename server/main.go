@@ -47,10 +47,19 @@ func WithJWT(secret []byte) fiber.Handler {
 	})
 }
 
-func InitDB(name, driver, dsn string) (*squealx.DB, error) {
+func InitDB(name, driver, dsn string, pool config.Pool) (*squealx.DB, error) {
 	db, err := squealx.Open(driver, dsn, name)
 	if err != nil {
 		return nil, err
+	}
+	if pool.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(pool.MaxOpenConns)
+	}
+	if pool.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(pool.MaxIdleConns)
+	}
+	if pool.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(time.Duration(pool.ConnMaxLifetime) * time.Second)
 	}
 	if err := db.Ping(); err != nil {
 		return nil, err
@@ -92,7 +101,7 @@ func Run(ctx context.Context) error {
 	dbProviders := make(map[string]*squealx.DB)
 	var defaultDB *squealx.DB
 	for _, p := range cfg.Provider {
-		dbConn, err := InitDB(p.Name, p.Driver, p.DSN)
+		dbConn, err := InitDB(p.Name, p.Driver, p.DSN, p.Pool)
 		if err != nil {
 			log.Fatalf("db init for provider %s: %v", p.Name, err)
 		}
@@ -115,28 +124,52 @@ func Run(ctx context.Context) error {
 	}
 	srvConfig := fiber.Config{
 		AppName:      cfg.Server.Name,
-		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * 1000,
-		WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * 1000,
-		IdleTimeout:  time.Duration(cfg.Server.IdleTimeout) * 1000,
+		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * time.Second,
+		WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * time.Second,
+		IdleTimeout:  time.Duration(cfg.Server.IdleTimeout) * time.Second,
 	}
 
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
 		switch m.Type {
 		case "logger":
-			globalMW[m.Name] = logger.New()
+			globalMW[m.Name] = logger.New(logger.Config{
+				Format:     m.Format,
+				TimeZone:   "Local",
+				TimeFormat: time.RFC3339,
+				Output:     os.Stdout, // Could be extended to support file output
+			})
 		case "jwt":
 			globalMW[m.Name] = WithJWT([]byte(m.Secret))
 		case "cors":
-			globalMW[m.Name] = cors.New()
+			globalMW[m.Name] = cors.New(cors.Config{
+				AllowOrigins:     strings.Join(m.AllowOrigins, ","),
+				AllowMethods:     strings.Join(m.AllowMethods, ","),
+				AllowHeaders:     strings.Join(m.AllowHeaders, ","),
+				ExposeHeaders:    strings.Join(m.ExposeHeaders, ","),
+				AllowCredentials: m.AllowCredentials,
+				MaxAge:           m.MaxAge,
+			})
 		case "ratelimit":
-			globalMW[m.Name] = limiter.New()
+			globalMW[m.Name] = limiter.New(limiter.Config{
+				Max:        m.Max,
+				Expiration: time.Duration(m.Window) * time.Second,
+				KeyGenerator: func(c *fiber.Ctx) string {
+					if m.Key == "userID" {
+						if uid := c.Locals("ctx_userid"); uid != nil {
+							return uid.(string)
+						}
+					}
+					return c.IP()
+				},
+			})
 		case "compress":
 			globalMW[m.Name] = compress.New()
 		case "recover":
 			globalMW[m.Name] = recover.New()
 		case "circuit_breaker":
-			// No-op: Fiber does not have built-in circuit breaker, user can implement custom
+			// TODO: Implement circuit breaker logic using m.FailureThreshold, m.RecoveryTimeout
+			globalMW[m.Name] = func(c *fiber.Ctx) error { return c.Next() }
 		case "request_id":
 			globalMW[m.Name] = requestid.New(requestid.Config{
 				Header: m.HeaderName,
