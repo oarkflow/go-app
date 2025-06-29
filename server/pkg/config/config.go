@@ -36,22 +36,42 @@ type Model struct {
 	Name     string       `bcl:"name"`
 	Table    string       `bcl:"table"`
 	Rest     bool         `bcl:"rest"`
-	Prefix   string       `bcl:"prefix,optional"`
-	Provider string       `bcl:"provider,optional"`
+	Prefix   string       `bcl:"prefix"`
+	Provider string       `bcl:"provider"`
 	Fields   []ModelField `bcl:"fields"`
 }
 
+type Pool struct {
+	MaxOpenConns    int `bcl:"max_open_conns"`
+	MaxIdleConns    int `bcl:"max_idle_conns"`
+	ConnMaxLifetime int `bcl:"conn_max_lifetime"` // in seconds
+}
+
 type Provider struct {
-	Name    string `bcl:"name"`
-	Driver  string `bcl:"driver"`
-	Type    string `bcl:"type"`
-	DSN     string `bcl:"dsn"`
-	Default bool   `bcl:"default"`
+	Name    string         `bcl:"name"`
+	Driver  string         `bcl:"driver"`
+	Type    string         `bcl:"type"`
+	DSN     string         `bcl:"dsn"`
+	Default bool           `bcl:"default"`
+	Pool    Pool           `bcl:"pool"`
+	Options map[string]any `bcl:"options"`
 }
 
 type HealthCheck struct {
 	Enabled bool   `bcl:"enabled"`
 	Path    string `bcl:"path"`
+}
+
+type Maintenance struct {
+	Enabled bool   `bcl:"enabled"`
+	Route   string `bcl:"route"`
+	HTML    string `bcl:"html"`
+}
+
+type Migrations struct {
+	Enabled bool   `bcl:"enabled"`
+	Dir     string `bcl:"dir"`
+	Table   string `bcl:"table"`
 }
 
 type Server struct {
@@ -65,6 +85,8 @@ type Server struct {
 	BodyLimit       int         `bcl:"body_limit"`
 	HealthCheck     HealthCheck `bcl:"health_check"`
 	TLS             TLSConfig   `bcl:"tls"`
+	Maintenance     Maintenance `bcl:"maintenance"`
+	Migrations      Migrations  `bcl:"migrations"`
 }
 
 type TLSConfig struct {

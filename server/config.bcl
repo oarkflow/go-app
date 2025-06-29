@@ -25,7 +25,19 @@ server "Server App" {
     enabled = true
     path    = "/health"
   }
+  maintenance {
+    enabled = true
+    route    = "/maintenance"
+    html    = "./public/maintenance.html"
+  }
 }
+
+migrations {
+  enabled  = true
+  dir      = "./db/migrations"
+  table    = "schema_migrations"
+}
+
 
 # 2. Data Provider Definitions
 provider "master-sqlite" {
@@ -33,6 +45,11 @@ provider "master-sqlite" {
   type    = "database"
   dsn     = "file:app.db?cache=shared&mode=rwc"
   default = true
+  pool = {
+    max_open_conns = 10
+    max_idle_conns = 5
+    conn_max_lifetime = 300  # seconds
+  }
 }
 
 # 3. Middleware Definitions
@@ -273,7 +290,6 @@ dag "loginHandler" {
     input  = ["user"]
     output = ["token"]
   }
-
   edge {
     from = "verify"
     to   = "token"

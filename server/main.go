@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	jwtware "github.com/gofiber/contrib/jwt"
 	"github.com/gofiber/fiber/v2"
@@ -112,7 +113,12 @@ func Run(ctx context.Context) error {
 	if cfg.Server.BodyLimit == 0 {
 		cfg.Server.BodyLimit = 10000000
 	}
-	srvConfig := fiber.Config{AppName: cfg.Server.Name, BodyLimit: cfg.Server.BodyLimit}
+	srvConfig := fiber.Config{
+		AppName:      cfg.Server.Name,
+		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * 1000,
+		WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * 1000,
+		IdleTimeout:  time.Duration(cfg.Server.IdleTimeout) * 1000,
+	}
 
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
@@ -151,6 +157,25 @@ func Run(ctx context.Context) error {
 		}
 		app.Get(path, func(c *fiber.Ctx) error {
 			return c.Status(200).JSON(fiber.Map{"status": "ok"})
+		})
+	}
+	// Maintenance mode middleware
+	if cfg.Server.Maintenance.Enabled {
+		maintenancePath := cfg.Server.Maintenance.Route
+		if maintenancePath == "" {
+			maintenancePath = "/maintenance"
+		}
+		app.Get(maintenancePath, func(c *fiber.Ctx) error {
+			if cfg.Server.Maintenance.HTML != "" {
+				return c.SendFile(cfg.Server.Maintenance.HTML, false)
+			}
+			return c.Status(503).SendString("Service is under maintenance")
+		})
+		app.Use(func(c *fiber.Ctx) error {
+			if c.Path() != maintenancePath {
+				return c.Redirect(cfg.Server.Maintenance.Route)
+			}
+			return c.Next()
 		})
 	}
 
@@ -392,7 +417,22 @@ func Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	log.Println("Draining server connections and shutting down")
-	_ = app.Shutdown()
+
+	shutdownTimeout := time.Duration(cfg.Server.ShutdownTimeout) * time.Second
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	shutdownCh := make(chan struct{})
+	go func() {
+		_ = app.Shutdown()
+		close(shutdownCh)
+	}()
+	select {
+	case <-shutdownCh:
+		log.Println("Server shutdown completed")
+	case <-shutdownCtx.Done():
+		log.Println("Server shutdown timed out")
+	}
+
 	return <-errCh
 }
 
