@@ -25,6 +25,11 @@ type Config struct {
 	DAG              []DAG        `bcl:"dag"`
 	Models           []Model      `bcl:"model"`
 	Auth             Auth         `bcl:"auth"`
+	Metrics          Metrics      `bcl:"metrics"`
+	Tracing          Tracing      `bcl:"tracing"`
+	Docs             Docs         `bcl:"docs"`
+	Features         Features     `bcl:"features"`
+	AuthGuard        []AuthGuard  `bcl:"auth_guard"`
 }
 
 type Model struct {
@@ -50,17 +55,92 @@ type HealthCheck struct {
 }
 
 type Server struct {
-	Name         string      `bcl:"name"`
-	Address      string      `bcl:"address"`
-	ReadTimeout  int         `bcl:"read_timeout"`
-	WriteTimeout int         `bcl:"write_timeout"`
-	HealthCheck  HealthCheck `bcl:"health_check"`
+	Name            string      `bcl:"name"`
+	Address         string      `bcl:"address"`
+	ReadTimeout     int         `bcl:"read_timeout"`
+	WriteTimeout    int         `bcl:"write_timeout"`
+	IdleTimeout     int         `bcl:"idle_timeout"`
+	HeaderTimeout   int         `bcl:"header_timeout"`
+	ShutdownTimeout int         `bcl:"shutdown_timeout"`
+	BodyLimit       int         `bcl:"body_limit"`
+	HealthCheck     HealthCheck `bcl:"health_check"`
+	TLS             TLSConfig   `bcl:"tls"`
+}
+
+type TLSConfig struct {
+	CertFile     string   `bcl:"cert_file"`
+	KeyFile      string   `bcl:"key_file"`
+	MinVersion   string   `bcl:"min_version"`
+	CipherSuites []string `bcl:"cipher_suites"`
+}
+
+type Metrics struct {
+	Enabled   bool   `bcl:"enabled"`
+	Path      string `bcl:"path"`
+	Provider  string `bcl:"provider"`
+	Namespace string `bcl:"namespace"`
+}
+
+type Tracing struct {
+	Enabled    bool   `bcl:"enabled"`
+	Provider   string `bcl:"provider"`
+	Endpoint   string `bcl:"endpoint"`
+	Sampler    string `bcl:"sampler"`
+	SamplerArg int    `bcl:"sampler_arg"`
+}
+
+type Docs struct {
+	Enabled bool   `bcl:"enabled"`
+	Path    string `bcl:"path"`
+	Spec    string `bcl:"spec"`
+}
+
+type Features struct {
+	BetaFeature bool `bcl:"beta_feature"`
+	NewUI       bool `bcl:"new_ui"`
+}
+
+type StaticConfig struct {
+	Dir      string `bcl:"dir"`
+	Index    string `bcl:"index"`
+	CacheMax int    `bcl:"cache_max"`
+}
+
+type StaticRoute struct {
+	Dir      string `bcl:"dir"`
+	Index    string `bcl:"index"`
+	CacheMax int    `bcl:"cache_max"`
+}
+
+type AuthGuard struct {
+	Name        string `bcl:"name"`
+	Placeholder string `bcl:"placeholder"`
+	Key         string `bcl:"key"`
+	Scheme      string `bcl:"scheme"`
 }
 
 type Middleware struct {
-	Name   string `bcl:"name"`
-	Type   string `bcl:"type"`
-	Secret string `bcl:"secret"`
+	Name             string   `bcl:"name"`
+	Type             string   `bcl:"type"`
+	Secret           string   `bcl:"secret"`
+	Format           string   `bcl:"format"`
+	Level            string   `bcl:"level"`
+	Output           string   `bcl:"output"`
+	Max              int      `bcl:"max"`
+	Window           int      `bcl:"window"`
+	Key              string   `bcl:"key"`
+	FailureThreshold int      `bcl:"failure_threshold"`
+	RecoveryTimeout  int      `bcl:"recovery_timeout"`
+	HeaderName       string   `bcl:"header_name"`
+	Generator        string   `bcl:"generator"`
+	MaxFiles         int      `bcl:"max_files"`
+	MaxSize          int      `bcl:"max_size"`
+	AllowOrigins     []string `bcl:"allow_origins"`
+	AllowMethods     []string `bcl:"allow_methods"`
+	AllowHeaders     []string `bcl:"allow_headers"`
+	ExposeHeaders    []string `bcl:"expose_headers"`
+	AllowCredentials bool     `bcl:"allow_credentials"`
+	MaxAge           int      `bcl:"max_age"`
 }
 
 type Group struct {
@@ -135,6 +215,7 @@ type Route struct {
 	ResponseFormat ResponseFormat   `bcl:"response_format"`
 	Hooks          []Hook           `bcl:"hooks"`
 	Version        string           `bcl:"version"`
+	Static         StaticRoute      `bcl:"static"`
 }
 
 type DAG struct {

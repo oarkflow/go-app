@@ -1,13 +1,33 @@
+#############################################
+# Production‑Ready HTTP Server Configuration #
+#############################################
+
+# 1. Core Server Settings
 server "Server App" {
-  address      = "${env.APP_HOST}"
-  read_timeout = 10
-  write_timeout= 10
+  address          = ":${env.APP_PORT}"   # host:port
+  read_timeout     = 10            # seconds
+  write_timeout    = 10            # seconds
+  idle_timeout     = 120           # seconds
+  header_timeout   = 5             # seconds
+  shutdown_timeout = 30            # seconds
+  body_limit = 10000000
+
+  # TLS / HTTPS
+  tls {
+    cert_file   = "${env.TLS_CERT_PATH}"     # PEM
+    key_file    = "${env.TLS_KEY_PATH}"      # PEM
+    min_version = "TLS1.2"
+    # cipher_suites = ["TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", ...]
+  }
+
+  # Health check endpoint
   health_check {
     enabled = true
-	path = "/health"
+    path    = "/health"
   }
 }
 
+# 2. Data Provider Definitions
 provider "master-sqlite" {
   driver  = "sqlite"
   type    = "database"
@@ -15,8 +35,12 @@ provider "master-sqlite" {
   default = true
 }
 
-middleware "log" {
-  type = "logger"
+# 3. Middleware Definitions
+middleware "logger" {
+  type   = "logger"
+  format = "json"       # text | json
+  level  = "info"       # debug | info | warn | error
+  output = "stdout"
 }
 
 middleware "jwt" {
@@ -25,169 +49,77 @@ middleware "jwt" {
   secret = "supersecret"
 }
 
+middleware "recover" {
+  type   = "recover"
+  format = "json"       # json | html
+}
+
 middleware "cors" {
-  type          = "cors"
-  allow_origins = "*" // allow all origins
+  type               = "cors"
+  allow_origins      = ["https://example.com"]
+  allow_methods      = ["GET","POST","OPTIONS"]
+  allow_headers      = ["Authorization","Content-Type"]
+  expose_headers     = ["X-Total-Count"]
+  allow_credentials  = true
+  max_age            = 3600         # seconds
 }
 
 middleware "ratelimit" {
-  type   = "ratelimit"
-  max    = 100
-  window = 60
+  type              = "ratelimit"
+  max               = 100
+  window            = 60            # seconds
+  key               = "ip"         # or "userID"
 }
 
 middleware "compress" {
   type = "compress"
 }
 
-global_middleware = ["log", "cors", "ratelimit", "compress"]
-
-group "admin" {
-  path       = "/admin"
-  middleware = ["log", "jwt"]
+middleware "circuit_breaker" {
+  type              = "circuit_breaker"
+  failure_threshold = 5
+  recovery_timeout  = 60              # seconds
 }
 
-route "login" {
-  method  = "POST"
-  path    = "/login"
-  handler = "loginHandler"
-  validation = [
-    { field = "email", required = true, type = "string" },
-    { field = "password", required = true, type = "string" }
-  ]
-  error_format {
-    code_field    = "code"
-    message_field = "error"
-  }
-  response_format {
-    envelope = "data"
-  }
-  version = "1"
-
-  request {
-    body = ["email", "password"]
-  }
-
-  response {
-    fields = ["token"]
-  }
+middleware "request_id" {
+  type        = "request_id"
+  header_name = "X-Request-ID"
+  generator   = "uuid"
 }
 
-route "logout" {
-  method     = "POST"
-  path       = "/logout"
-  handler    = "logoutHandler"
-  middleware = ["jwt"]
+# Order in which global middleware will be applied
+global_middleware = ["request_id", "recover", "logger", "cors", "ratelimit", "compress"]
 
-  error_format {
-    code_field    = "code"
-    message_field = "error"
-  }
-  response_format {
-    envelope = "data"
-  }
-  version = "1"
-
-  response {
-    fields = ["success"]
-  }
+# 4. Observability / Monitoring
+metrics {
+  enabled   = true
+  path      = "/metrics"
+  provider  = "prometheus"
+  namespace = "app_server"
 }
 
-route "profile" {
-  method     = "GET"
-  path       = "/me"
-  handler    = "profileHandler"
-  middleware = ["jwt"]
-
-  error_format {
-    code_field    = "code"
-    message_field = "error"
-  }
-  response_format {
-    envelope = "data"
-  }
-  version = "1"
-
-  response {
-    fields = ["user"]
-  }
+tracing {
+  enabled     = true
+  provider    = "jaeger"
+  endpoint    = "${env.JAEGER_AGENT_URL}"
+  sampler     = "ratelimiting"
+  sampler_arg = 100                   # traces/sec
 }
 
-route "adminProfile" {
-  group   = "admin"
-  method  = "GET"
-  path    = "/profile"
-  handler = "profileHandler"
-
-  error_format {
-    code_field    = "code"
-    message_field = "error"
-  }
-  response_format {
-    envelope = "data"
-  }
-  version = "1"
-
-  response {
-    fields = ["user"]
-  }
+# 5. Documentation / API Spec
+docs {
+  enabled = true
+  path    = "/swagger/*"
+  spec    = "/swagger/doc.json"
 }
 
-dag "loginHandler" {
-  node "verify" {
-    type   = "auth_verify"
-    input  = ["email", "password"]
-    output = ["user"]
-  }
-
-  node "token" {
-    type   = "auth_token"
-    input  = ["user"]
-    output = ["token"]
-  }
-
-  edge {
-    from = "verify"
-    to   = "token"
-  }
-  version = "1"
+# 6. Feature Flags
+features {
+  beta_feature = false
+  new_ui       = true
 }
 
-dag "logoutHandler" {
-  node "revoke" {
-    type   = "auth_revoke"
-    output = ["success"]
-  }
-  version = "1"
-}
-
-dag "profileHandler" {
-  node "fetch" {
-    type     = "db_query"
-    query    = "SELECT id, name, email FROM users WHERE id = :id"
-    input    = ["ctx_userid"]
-    field_mapping = {
-      id    = "ctx_userid"
-    }
-    output   = ["user"]
-    provider = "master-sqlite"
-  }
-  version = "1"
-}
-
-model "user" {
-  table    = "users"
-  rest     = true
-  prefix   = "users"
-  provider = "master-sqlite"
-  fields = [
-    { name = "id", data_type = "TEXT" },
-    { name = "name", data_type = "TEXT" },
-    { name = "email", data_type = "TEXT" },
-    { name = "password", data_type = "TEXT" }
-  ]
-}
-
+# 7. Authentication / Authorization
 auth {
   login {
     route            = "login"
@@ -206,4 +138,182 @@ auth_guard "jwt" {
   placeholder = "header"
   key         = "Authorization"
   scheme      = "Bearer"
+}
+
+route "static" {
+  method  = "GET"
+  path    = "/static/*"
+  handler = "staticHandler"
+
+  static {
+    dir       = "./public"
+    index     = "index.html"
+    cache_max = 86400                  # seconds
+  }
+}
+
+# 9. API Routes & DAG Handlers
+
+route "login" {
+  method  = "POST"
+  path    = "/login"
+  handler = "loginHandler"
+
+  validation = [
+    { field = "email",    required = true, type = "string" },
+    { field = "password", required = true, type = "string" }
+  ]
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+
+  response_format {
+    envelope = "data"
+  }
+
+  version = "1"
+
+  request {
+    body = ["email","password"]
+  }
+
+  response {
+    fields = ["token"]
+  }
+}
+
+route "logout" {
+  method     = "POST"
+  path       = "/logout"
+  handler    = "logoutHandler"
+  middleware = ["jwt"]
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+
+  response_format {
+    envelope = "data"
+  }
+
+  version = "1"
+
+  response {
+    fields = ["success"]
+  }
+}
+
+route "profile" {
+  method     = "GET"
+  path       = "/me"
+  handler    = "profileHandler"
+  middleware = ["jwt"]
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+
+  response_format {
+    envelope = "data"
+  }
+
+  version = "1"
+
+  response {
+    fields = ["user"]
+  }
+}
+
+route "adminProfile" {
+  group      = "admin"
+  method     = "GET"
+  path       = "/profile"
+  handler    = "profileHandler"
+
+  error_format {
+    code_field    = "code"
+    message_field = "error"
+  }
+
+  response_format {
+    envelope = "data"
+  }
+
+  version = "1"
+
+  response {
+    fields = ["user"]
+  }
+}
+
+# 10. Admin Group
+
+group "admin" {
+  path       = "/admin"
+  middleware = ["logger","jwt"]
+}
+
+# 11. DAG / Workflow Definitions
+
+dag "loginHandler" {
+  version = "1"
+
+  node "verify" {
+    type   = "auth_verify"
+    input  = ["email","password"]
+    output = ["user"]
+  }
+
+  node "token" {
+    type   = "auth_token"
+    input  = ["user"]
+    output = ["token"]
+  }
+
+  edge {
+    from = "verify"
+    to   = "token"
+  }
+}
+
+dag "logoutHandler" {
+  version = "1"
+
+  node "revoke" {
+    type   = "auth_revoke"
+    output = ["success"]
+  }
+}
+
+dag "profileHandler" {
+  version = "1"
+
+  node "fetch" {
+    type          = "db_query"
+    query         = "SELECT id, name, email FROM users WHERE id = :id"
+    input         = ["ctx_userid"]
+    field_mapping = { id = "ctx_userid" }
+    output        = ["user"]
+    provider      = "master-sqlite"
+  }
+}
+
+# 12. Data Models
+
+model "user" {
+  table    = "users"
+  rest     = true
+  prefix   = "users"
+  provider = "master-sqlite"
+
+  fields = [
+    { name = "id",       data_type = "TEXT" },
+    { name = "name",     data_type = "TEXT" },
+    { name = "email",    data_type = "TEXT" },
+    { name = "password", data_type = "TEXT" }
+  ]
 }

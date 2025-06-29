@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	jwtware "github.com/gofiber/contrib/jwt"
@@ -12,9 +14,12 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gofiber/fiber/v2/middleware/requestid"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/oarkflow/bcl"
 	"github.com/oarkflow/squealx"
+	"github.com/oarkflow/xid"
 	_ "modernc.org/sqlite"
 
 	"github.com/oarkflow/dag/server/pkg/config"
@@ -50,6 +55,20 @@ func InitDB(name, driver, dsn string) (*squealx.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func staticHandler(dir, index string, cacheMax int) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		file := c.Params("*")
+		if file == "" {
+			file = index
+		}
+		fp := filepath.Join(dir, file)
+		if cacheMax > 0 {
+			c.Set("Cache-Control", "public, max-age="+strconv.Itoa(cacheMax))
+		}
+		return c.SendFile(fp, false)
+	}
 }
 
 func main() {
@@ -90,16 +109,11 @@ func Run(ctx context.Context) error {
 		handlers.ModelsMap[m.Name] = m
 	}
 	handlers.AuthCfg = cfg.Auth
-	app := fiber.New(fiber.Config{AppName: cfg.Server.Name})
-	if cfg.Server.HealthCheck.Enabled {
-		path := cfg.Server.HealthCheck.Path
-		if path == "" {
-			path = "/health"
-		}
-		app.Get(path, func(c *fiber.Ctx) error {
-			return c.Status(200).JSON(fiber.Map{"status": "ok"})
-		})
+	if cfg.Server.BodyLimit == 0 {
+		cfg.Server.BodyLimit = 10000000
 	}
+	srvConfig := fiber.Config{AppName: cfg.Server.Name, BodyLimit: cfg.Server.BodyLimit}
+
 	globalMW := map[string]fiber.Handler{}
 	for _, m := range cfg.Middleware {
 		switch m.Type {
@@ -113,8 +127,65 @@ func Run(ctx context.Context) error {
 			globalMW[m.Name] = limiter.New()
 		case "compress":
 			globalMW[m.Name] = compress.New()
+		case "recover":
+			globalMW[m.Name] = recover.New()
+		case "circuit_breaker":
+			// No-op: Fiber does not have built-in circuit breaker, user can implement custom
+		case "request_id":
+			globalMW[m.Name] = requestid.New(requestid.Config{
+				Header: m.HeaderName,
+				Generator: func() string {
+					// Use UUID or custom generator if needed
+					return xid.New().String()
+				},
+			})
 		default:
 			log.Fatalf("unsupported middleware: %s", m.Type)
+		}
+	}
+	app := fiber.New(srvConfig)
+	if cfg.Server.HealthCheck.Enabled {
+		path := cfg.Server.HealthCheck.Path
+		if path == "" {
+			path = "/health"
+		}
+		app.Get(path, func(c *fiber.Ctx) error {
+			return c.Status(200).JSON(fiber.Map{"status": "ok"})
+		})
+	}
+
+	// Metrics endpoint
+	if cfg.Metrics.Enabled {
+		app.Get(cfg.Metrics.Path, func(c *fiber.Ctx) error {
+			// TODO: Integrate with Prometheus or other metrics provider
+			return c.SendString("# Metrics endpoint (stub)\n")
+		})
+	}
+
+	// Tracing middleware (stub)
+	if cfg.Tracing.Enabled {
+		app.Use(func(c *fiber.Ctx) error {
+			// TODO: Integrate with OpenTelemetry or Jaeger
+			return c.Next()
+		})
+	}
+
+	// Feature flags endpoint (optional, for demonstration)
+	app.Get("/system/features", func(c *fiber.Ctx) error {
+		return c.JSON(cfg.Features)
+	})
+
+	// Docs endpoint (Swagger/OpenAPI)
+	if cfg.Docs.Enabled && cfg.Docs.Path != "" && cfg.Docs.Spec != "" {
+		app.Get(cfg.Docs.Path, func(c *fiber.Ctx) error {
+			return c.SendFile(cfg.Docs.Spec, false)
+		})
+	}
+
+	// Register static routes before other routes
+	for _, r := range cfg.Route {
+		if r.Handler == "staticHandler" && r.Static.Dir != "" {
+			app.Get(r.Path, staticHandler(r.Static.Dir, r.Static.Index, r.Static.CacheMax))
 		}
 	}
 	for _, mwName := range cfg.GlobalMiddleware {
@@ -126,6 +197,10 @@ func Run(ctx context.Context) error {
 	}
 	dags := dag.BuildDAGs(&cfg, dbProviders, defaultDB, handlers.ModelsMap, handlers.AuthCfg)
 	for _, r := range cfg.Route {
+		if r.Handler == "staticHandler" && r.Static.Dir != "" {
+			// Already registered above
+			continue
+		}
 		fullPath := r.Path
 		if r.Version != "" {
 			fullPath = "/v" + r.Version + fullPath
@@ -303,10 +378,16 @@ func Run(ctx context.Context) error {
 		})
 	})
 
+	tlsEnabled := cfg.Server.TLS.CertFile != "" && cfg.Server.TLS.KeyFile != ""
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("Listening on %s...", cfg.Server.Address)
-		errCh <- app.Listen(cfg.Server.Address)
+		if tlsEnabled {
+			errCh <- app.ListenTLS(cfg.Server.Address, cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+		} else {
+			errCh <- app.Listen(cfg.Server.Address)
+		}
 	}()
 
 	<-ctx.Done()

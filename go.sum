@@ -310,6 +310,8 @@ github.com/oarkflow/squealx v0.0.54 h1:ek2b/nBbgY3zlHkjO1yfYGYyFdQ13PDK3wG5cgcD4
 github.com/oarkflow/squealx v0.0.54/go.mod h1:YCmPIh90NCl9OHQUcuZqpxNsH0q9INkRy93UdBWFhpw=
 github.com/oarkflow/supervisor v0.0.0-20250616090112-d69979fa94bb h1:92rvnokFu/5VEJwMtm4tdy5Em6JUR+maumORWRAnGPw=
 github.com/oarkflow/supervisor v0.0.0-20250616090112-d69979fa94bb/go.mod h1:yNCAYr/aDnjsIuUTRO594H14ISLPZ5FMupZLYEt5B+s=
+github.com/oarkflow/xid v1.2.8 h1:uCIX61Binq2RPMsqImZM6pPGzoZTmRyD6jguxF9aAA0=
+github.com/oarkflow/xid v1.2.8/go.mod h1:jG4YBh+swbjlWApGWDBYnsJEa7hi3CCpmuqhB3RAxVo=
 github.com/onsi/ginkgo/v2 v2.23.4 h1:ktYTpKJAVZnDT4VjxSbiBenUjmlL/5QkBEocaWXiQus=
 github.com/onsi/ginkgo/v2 v2.23.4/go.mod h1:Bt66ApGPBFzHyR+JO10Zbt0Gsp4uWxu5mIOTusL46e8=
 github.com/onsi/gomega v1.36.3 h1:hID7cr8t3Wp26+cYnfcjR6HpJ00fdogN6dqZ1t6IylU=
